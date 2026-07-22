@@ -516,8 +516,14 @@ def generate_report():
         low = td['low']
         open_price = td['open']
 
-        # 使用专门的52周数据
+        # 使用专门的52周数据（尝试带前缀和不带前缀两种key）
         tw = tracked_52w.get(code, {})
+        if not tw:
+            # 尝试匹配带前缀的key
+            for prefix in ['sh', 'sz']:
+                tw = tracked_52w.get(f'{prefix}{code}', {})
+                if tw:
+                    break
         high52 = tw.get('high_52w', 0)
         low52 = tw.get('low_52w', 0)
 

@@ -89,6 +89,14 @@ ETF_CANDIDATES = [
     'sh512760','sh515050','sh512660','sh516510','sh512880','sh513180','sh159766',
 ]
 
+# 专项跟踪 ETF（用户指定）
+TRACKED_ETFS = ['sh512690', 'sz159781']
+TRACKED_ETF_NAMES = {'sh512690': '酒ETF(512690)', 'sz159781': '科创创业ETF易方达(159781)'}
+TRACKED_ETF_DESC = {
+    'sh512690': '跟踪中证酒指数，覆盖白酒、啤酒、葡萄酒龙头',
+    'sz159781': '跟踪科创创业50指数，覆盖科创板和创业板龙头科技公司',
+}
+
 def get_index_data():
     url = f"https://qt.gtimg.cn/q={','.join(INDEX_CODES)}"
     resp = safe_get(url)
@@ -439,10 +447,186 @@ def generate_report():
         L.append(f"| {'⭐' if i==1 else '★'} {i} | {e['code']} | **{e['name']}** | {num2(e['price'])} | {pct(e['chg_pct'])} | {amt(e['amount'])} | {e.get('etf_reasons','')} |")
     L.append(f"")
 
-    # 五、财经要闻
+    # ETF 专项跟踪（新增模块）
     L.append(f"---")
     L.append(f"")
-    L.append(f"## 五、📰 财经要闻")
+    L.append(f"## 五、🔍 ETF 专项跟踪")
+    L.append(f"")
+    L.append(f"> 每日跟踪用户指定的两只 ETF，提供行情分析和投资建议")
+    L.append(f"")
+
+    # 获取跟踪 ETF 数据
+    tracked_data = get_stock_data(TRACKED_ETFS)
+    # 获取跟踪ETF的指数成分股行情（用于深度分析）
+    liquor_stocks = ['sh600519','sz000858','sz000568','sh600809','sz002304',
+                     'sh600600','sh600132','sz000596','sz000799','sh600559']
+    tech_stocks = ['sz300750','sz300760','sz300124','sz300274','sh688981',
+                   'sh688036','sz300014','sz300408','sz300450','sz002475']
+
+    liquor_data = get_stock_data(liquor_stocks)
+    tech_data = get_stock_data(tech_stocks)
+
+    for td in tracked_data:
+        code = td['code']
+        name = TRACKED_ETF_NAMES.get(code, td['name'])
+        desc = TRACKED_ETF_DESC.get(code, '')
+        price = td['price']
+        chg_pct = td['chg_pct']
+        amount = td['amount']
+        high52 = td['high_52w']
+        low52 = td['low_52w']
+        prev_close = td['prev_close']
+        high = td['high']
+        low = td['low']
+
+        # 计算技术指标
+        # 距52周高点回撤
+        dd_52w = (high52 - price) / high52 * 100 if high52 > 0 and price > 0 else 0
+        # 距52周低点涨幅
+        up_52w = (price - low52) / low52 * 100 if low52 > 0 and price > 0 else 0
+        # 当日振幅
+        amplitude = (high - low) / prev_close * 100 if prev_close > 0 and high > 0 and low > 0 else 0
+        # 收盘在当日区间的位置
+        day_pos = (price - low) / (high - low) * 100 if high != low and high > 0 and low > 0 else 50
+
+        # 确定关联的指数和成分股
+        # 腾讯返回的 code 可能不带 sh/sz 前缀
+        raw_code = code.replace('sh','').replace('sz','')
+        if '512690' in code or raw_code == '512690':
+            related_index = '中证酒指数'
+            related_stocks = liquor_data
+            stock_label = '白酒/啤酒龙头'
+        else:
+            related_index = '科创创业50指数'
+            related_stocks = tech_data
+            stock_label = '科创创业龙头'
+
+        # 分析成分股表现
+        if related_stocks:
+            up_count = sum(1 for s in related_stocks if s['chg_pct'] > 0)
+            down_count = sum(1 for s in related_stocks if s['chg_pct'] < 0)
+            avg_chg = sum(s['chg_pct'] for s in related_stocks) / len(related_stocks)
+        else:
+            up_count = down_count = 0
+            avg_chg = 0
+
+        # 投资建议逻辑
+        suggestions = []
+        risk_level = '中'
+
+        # 位置判断
+        if dd_52w > 15:
+            suggestions.append(f'距52周高点回调{dd_52w:.0f}%，处于相对低位，具备一定安全边际')
+            if chg_pct > 0:
+                suggestions.append('底部放量反弹，关注能否持续放量突破')
+        elif dd_52w < 3:
+            suggestions.append('接近52周高点，短期追高风险较大')
+            risk_level = '高'
+        elif 3 <= dd_52w <= 15:
+            suggestions.append(f'距52周高点{dd_52w:.0f}%回撤，处于合理区间')
+
+        # 趋势判断
+        if chg_pct > 3:
+            suggestions.append('短期强势上攻，但需警惕获利回吐')
+            if day_pos > 70:
+                suggestions.append('收盘位于日高附近，多头掌控局面')
+            risk_level = '中高' if risk_level != '高' else '高'
+        elif 0 <= chg_pct <= 3:
+            suggestions.append('温和上涨，趋势健康')
+        elif -3 <= chg_pct < 0:
+            suggestions.append('小幅回调，关注下方支撑')
+            risk_level = '中'
+        else:
+            suggestions.append('跌幅较大，短期趋势偏弱，等待企稳信号')
+            risk_level = '中低'
+
+        # 成交额判断
+        if amount > 5e8:
+            suggestions.append('成交活跃，流动性充裕')
+        elif amount > 1e8:
+            suggestions.append('成交适中')
+        else:
+            suggestions.append('成交偏淡，关注量能变化')
+
+        # 成分股联动分析
+        if avg_chg > 0 and up_count > down_count:
+            suggestions.append(f'成分股多数上涨({up_count}/{len(related_stocks)})，板块共振向上')
+        elif avg_chg < 0 and down_count > up_count:
+            suggestions.append(f'成分股多数下跌({down_count}/{len(related_stocks)})，板块承压')
+        else:
+            suggestions.append('成分股分化，精选个股更重要')
+
+        # 核心建议
+        if dd_52w > 20 and chg_pct <= 0:
+            core_suggestion = '🟢 深度回调+缩量调整，可考虑分批建仓，控制仓位不超过总资产20%'
+        elif dd_52w > 10 and 0 <= chg_pct <= 3:
+            core_suggestion = '🟢 回调充分+温和反弹，适合逢低布局，建议分批买入'
+        elif dd_52w < 5 and chg_pct > 3:
+            core_suggestion = '🟠 接近高位+放量上攻，短期有回调压力，建议持有者逢高减仓，新入场者等待回调'
+        elif dd_52w < 5 and chg_pct <= 0:
+            core_suggestion = '🟡 高位震荡，方向不明确，建议观望为主，等待方向选择'
+        elif chg_pct > 5:
+            core_suggestion = '🟠 短期涨幅过大，追高风险较高，建议耐心等待回调至5日均线附近再考虑'
+        else:
+            core_suggestion = '🟡 中性偏多，可小仓位试探性建仓，设置5%止损线'
+
+        # 生成表格
+        L.append(f"### {'🍷' if '512690' in code else '🚀'} {name}")
+        L.append(f"")
+        L.append(f"> {desc}")
+        L.append(f"")
+
+        L.append(f"#### 📊 今日行情")
+        L.append(f"")
+        L.append(f"| 指标 | 数据 |")
+        L.append(f"|------|------|")
+        emoji = "🔴" if chg_pct > 0 else ("🟢" if chg_pct < 0 else "⚪")
+        L.append(f"| 最新价 | {emoji} **{num2(price)}** |")
+        L.append(f"| 涨跌幅 | {pct(chg_pct)} |")
+        L.append(f"| 今开/最高/最低 | {num2(td['open'])} / {num2(high)} / {num2(low)} |")
+        L.append(f"| 成交额 | {amt(amount)} |")
+        L.append(f"| 52周高/低 | {num2(high52)} / {num2(low52)} |")
+        L.append(f"| 距52周高点 | {dd_52w:.1f}% |")
+        L.append(f"| 距52周低点 | +{up_52w:.1f}% |")
+        L.append(f"| 日内振幅 | {amplitude:.1f}% |")
+        L.append(f"| 跟踪指数 | {related_index} |")
+        L.append(f"")
+
+        # 成分股表现
+        L.append(f"#### 📈 成分股表现（{stock_label}）")
+        L.append(f"")
+        L.append(f"| 代码 | 名称 | 最新价 | 涨跌幅 | PE |")
+        L.append(f"|------|------|--------|--------|-----|")
+        sorted_related = sorted(related_stocks, key=lambda x: x['chg_pct'], reverse=True)
+        for s in sorted_related[:10]:
+            pe_str = f"{s['pe']:.1f}" if s['pe'] else '-'
+            L.append(f"| {s['code']} | {s['name']} | {num2(s['price'])} | {pct(s['chg_pct'])} | {pe_str} |")
+        L.append(f"")
+
+        # 成分股统计
+        L.append(f"| 统计 | 数值 |")
+        L.append(f"|------|------|")
+        L.append(f"| 上涨成分股 | {up_count}/{len(related_stocks)} |")
+        L.append(f"| 下跌成分股 | {down_count}/{len(related_stocks)} |")
+        L.append(f"| 平均涨跌幅 | {pct(avg_chg)} |")
+        L.append(f"")
+
+        # 分析建议
+        L.append(f"#### 💡 投资建议")
+        L.append(f"")
+        L.append(f"**风险等级**: {'🟢 低' if risk_level == '低' else '🟡 中' if risk_level == '中' else '🟠 中高' if risk_level == '中高' else '🔴 高'}")
+        L.append(f"")
+        L.append(f"**核心建议**: {core_suggestion}")
+        L.append(f"")
+        L.append(f"**详细分析**:")
+        for j, sug in enumerate(suggestions, 1):
+            L.append(f"{j}. {sug}")
+        L.append(f"")
+
+    # 五 → 六、财经要闻
+    L.append(f"---")
+    L.append(f"")
+    L.append(f"## 六、📰 财经要闻")
     L.append(f"")
     has_chip = any('半导体' in s for s, _, _ in sector_avg)
     has_ai = any(kw in ' '.join([s for s, _, _ in sector_avg]) for kw in ['AI','算力','通信'])
@@ -462,7 +646,7 @@ def generate_report():
     # 六、市场综述
     L.append(f"---")
     L.append(f"")
-    L.append(f"## 六、📝 市场综述与展望")
+    L.append(f"## 七、📝 市场综述与展望")
     L.append(f"")
 
     sh = next((d for d in index_data if d['name']=='上证指数'), None)

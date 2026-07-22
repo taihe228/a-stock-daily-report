@@ -155,23 +155,31 @@ def get_stock_data(codes):
     return results
 
 def get_etf_52week(code):
-    """从腾讯日K获取ETF的52周高低点"""
-    try:
-        prefix = 'sh' if code.startswith('sh') or (not code.startswith('sz') and code[0] in '56') else 'sz'
-        clean_code = code.replace('sh','').replace('sz','')
-        param = f'{prefix}{clean_code},day,,,250,qfq'
-        url = f'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={param}'
-        resp = requests.get(url, headers=HEADERS, timeout=15)
-        data = resp.json()
-        if data.get('code') == 0:
-            stock_data = data['data'].get(f'{prefix}{clean_code}', {})
-            days = stock_data.get('qfqday') or stock_data.get('day')
-            if days:
-                highs = [float(d[3]) for d in days]
-                lows = [float(d[4]) for d in days]
-                return max(highs), min(lows)
-    except Exception as e:
-        print(f"  ⚠️ {code} 52周数据获取失败: {e}")
+    """从腾讯日K获取ETF的52周高低点（含重试和备用API）"""
+    prefix = 'sh' if code.startswith('sh') or (not code.startswith('sz') and code[0] in '56') else 'sz'
+    clean_code = code.replace('sh','').replace('sz','')
+    # 尝试两个API端点 + 重试
+    urls = [
+        f'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix}{clean_code},day,,,250,qfq',
+        f'https://ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix}{clean_code},day,,,250,qfq',
+    ]
+    for url in urls:
+        for attempt in range(3):
+            try:
+                resp = requests.get(url, headers=HEADERS, timeout=20)
+                data = resp.json()
+                if data.get('code') == 0:
+                    stock_data = data['data'].get(f'{prefix}{clean_code}', {})
+                    days = stock_data.get('qfqday') or stock_data.get('day')
+                    if days and len(days) > 0:
+                        highs = [float(d[3]) for d in days]
+                        lows = [float(d[4]) for d in days]
+                        return max(highs), min(lows)
+            except Exception as e:
+                print(f"  ⚠️ {code} 52周数据尝试{attempt+1}失败: {e}")
+                time.sleep(1)
+        # 换下一个URL
+    print(f"  ❌ {code} 52周数据全部获取失败")
     return 0, 0
 
 # ============================================================
@@ -574,8 +582,14 @@ def generate_report():
         L.append(f"| 今开/最高/最低 | {num2(open_price)} / {num2(high)} / {num2(low)} |")
         L.append(f"| 成交额 | {amt(amount)} |")
         L.append(f"| 52周最高/最低 | {num2(high52)} / {num2(low52)} |")
-        L.append(f"| 距52周高点 | {dd_52w:.1f}%（{'+' if dd_52w>=0 else ''}{price-high52:+.3f}） |")
-        L.append(f"| 距52周低点 | +{up_52w:.1f}%（{'+' if price-low52>=0 else ''}{price-low52:+.3f}） |")
+        if high52 > 0:
+            L.append(f"| 距52周高点 | {dd_52w:.1f}%（{price-high52:+.3f}） |")
+        else:
+            L.append(f"| 距52周高点 | - |")
+        if low52 > 0:
+            L.append(f"| 距52周低点 | +{up_52w:.1f}%（{price-low52:+.3f}） |")
+        else:
+            L.append(f"| 距52周低点 | - |")
         L.append(f"| 日内振幅 | {amplitude:.1f}% |")
         L.append(f"| 跟踪指数 | {related_index} |")
         L.append(f"")

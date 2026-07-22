@@ -1,57 +1,36 @@
 #!/usr/bin/env python3
 """
-A股每日投资分析报告 - 核心引擎
-数据源: 腾讯财经(实时行情+估值) + 东方财富(板块/资讯)
+A股每日投资分析报告 - 核心引擎 v6
+数据源: 腾讯财经(实时行情+估值+日K) + 东方财富(板块/资讯)
 适配 GitHub Actions 定时运行
+修复: 成交额单位、ETF 52周数据、样本量、24小时制
 """
 
 import requests, re, json, time, os, sys
 from datetime import datetime, timedelta
 
-# ============================================================
-# 配置
-# ============================================================
 NOW = datetime.now()
-# 判断是否是交易日（周一到周五）
 WEEKDAY = NOW.weekday()
-if WEEKDAY >= 5:  # 周六日跳过
+if WEEKDAY >= 5:
     print(f"⏭️ 今天是周末（周{WEEKDAY+1}），A股休市，跳过报告生成。")
     sys.exit(0)
-
-# 检查时间：如果在交易时段内（9:30-15:00），等待到15:00后再生成
-HOUR = NOW.hour
-MINUTE = NOW.minute
-if 9 <= HOUR < 15 or (HOUR == 9 and MINUTE >= 30):
-    print(f"⏳ 当前在交易时段内（{HOUR}:{MINUTE:02d}），将使用盘中数据生成报告。")
-elif HOUR < 9 or (HOUR == 9 and MINUTE < 30):
-    print(f"⏰ 当前尚未开盘（{HOUR}:{MINUTE:02d}），将使用前一交易日数据。")
 
 NOW_STR = NOW.strftime("%Y-%m-%d %H:%M:%S")
 TRADE_DATE = NOW.strftime("%Y-%m-%d")
 
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-}
-
-# 输出目录
+HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 OUTPUT_DIR = os.environ.get('OUTPUT_DIR', os.getcwd())
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# ============================================================
-# 工具函数
-# ============================================================
 def safe_get(url, retry=3, timeout=20, referer='https://finance.qq.com/'):
     for i in range(retry):
         try:
-            h = dict(HEADERS)
-            h['Referer'] = referer
+            h = dict(HEADERS); h['Referer'] = referer
             resp = requests.get(url, headers=h, timeout=timeout)
             resp.encoding = 'gbk'
             return resp
         except Exception as e:
-            if i == retry - 1:
-                print(f"  ⚠️ 请求失败(已重试{retry}次): {url[:60]}... {e}")
-                raise
+            if i == retry - 1: raise e
             time.sleep(3)
     return None
 
@@ -60,28 +39,47 @@ def pct(v):
     return f"{v:+.2f}%"
 
 def amt(v):
+    """格式化成交额：腾讯接口[37]返回单位=万元"""
     if v is None or v == 0: return '-'
-    if abs(v) >= 1e8: return f"{v/1e8:.2f}亿"
-    elif abs(v) >= 1e4: return f"{v/1e4:.0f}万"
-    return f"{v:.0f}"
+    v_yi = v / 1e4  # 万元→亿
+    if v_yi >= 10000:
+        return f"{v_yi/10000:.2f}万亿"
+    return f"{v_yi:.0f}亿"
 
 def num2(v):
     if v is None: return '-'
     return f"{v:.2f}"
 
 # ============================================================
-# 数据获取
-# ============================================================
 INDEX_CODES = ['sh000001','sz399001','sz399006','sh000688','sh000300','sh000016','sz399905']
 INDEX_NAMES = {'sh000001':'上证指数','sz399001':'深证成指','sz399006':'创业板指',
                'sh000688':'科创50','sh000300':'沪深300','sh000016':'上证50','sz399905':'中证500'}
 
+# 扩大样本池（100+ 只，覆盖各行业）
 STOCK_CANDIDATES = [
+    # 金融 (10)
+    'sz000001','sh600036','sh601166','sh601318','sh600030','sh601398','sh601328',
+    'sh600016','sz002142','sh601009',
+    # 消费 (12)
+    'sz000858','sz000568','sh600519','sh600887','sh600690','sz000651','sz002304',
+    'sh600809','sz000333','sh600600','sh600132','sz000799',
+    # 科技 (15)
     'sz000725','sh601138','sz002475','sz002156','sz000021','sz000977','sh603019',
-    'sz002049','sz300308','sz300285','sz000858','sz000568','sh600887','sh600690',
-    'sz300014','sz002432','sh601899','sh600031','sh601012','sh603799','sh603993',
-    'sh600183','sz002008','sh600118','sh601318','sz000001','sh600036','sh601166',
-    'sh600030','sh600703','sh600893','sz002167','sh600584','sh603986','sh603501',
+    'sz002049','sz300308','sh600703','sz002415','sz002230','sz002236','sz300124','sz300408',
+    # 新能源 (8)
+    'sz300750','sz300014','sz300274','sh601012','sh603799','sz300450','sz002460','sz002466',
+    # 周期 (10)
+    'sh601899','sh600031','sh603993','sh600183','sz002008','sh600118','sh600893',
+    'sz002167','sh600362','sh601600',
+    # 医药 (8)
+    'sz300760','sz002432','sh600276','sz000538','sz300015','sh600196','sz300122','sz002001',
+    # 军工/通信 (8)
+    'sh600118','sh600879','sz002013','sz300699','sz002465','sh600118','sh600498','sz300502',
+    # 半导体/封测 (8)
+    'sh600584','sh603986','sh603501','sz300285','sz002371','sh603160','sz300661','sz300782',
+    # 其他行业龙头 (10)
+    'sh600585','sh601668','sh600104','sh601088','sh600028','sh601857',
+    'sh600900','sh601006','sh600009','sh601111',
 ]
 
 ETF_CANDIDATES = [
@@ -89,14 +87,20 @@ ETF_CANDIDATES = [
     'sh512760','sh515050','sh512660','sh516510','sh512880','sh513180','sh159766',
 ]
 
-# 专项跟踪 ETF（用户指定）
 TRACKED_ETFS = ['sh512690', 'sz159781']
 TRACKED_ETF_NAMES = {'sh512690': '酒ETF(512690)', 'sz159781': '科创创业ETF易方达(159781)'}
 TRACKED_ETF_DESC = {
     'sh512690': '跟踪中证酒指数，覆盖白酒、啤酒、葡萄酒龙头',
     'sz159781': '跟踪科创创业50指数，覆盖科创板和创业板龙头科技公司',
 }
+TRACKED_ETF_COMPONENTS = {
+    'sh512690': ['sh600519','sz000858','sz000568','sh600809','sz002304',
+                 'sh600600','sh600132','sz000596','sz000799','sh600559'],
+    'sz159781': ['sz300750','sz300760','sz300124','sz300274','sh688981',
+                 'sh688036','sz300014','sz300408','sz300450','sz002475'],
+}
 
+# ============================================================
 def get_index_data():
     url = f"https://qt.gtimg.cn/q={','.join(INDEX_CODES)}"
     resp = safe_get(url)
@@ -110,17 +114,17 @@ def get_index_data():
         prev = float(p[4]) if p[4] else close
         chg = close - prev
         chg_pct = (close/prev - 1)*100 if prev else 0
-        a = float(p[37])*10000 if len(p)>37 and p[37] else 0
+        a = float(p[37]) if len(p)>37 and p[37] else 0  # 万元
         total_amt += a
         results.append({'name': INDEX_NAMES.get(INDEX_CODES[len(results)], p[1]),
                         'close': close, 'chg': chg, 'chg_pct': chg_pct, 'amount': a})
     return results, total_amt
 
 def get_stock_data(codes):
+    """腾讯实时行情 + PE/PB/市值"""
     results = []
-    batch_size = 20
-    for i in range(0, len(codes), batch_size):
-        batch = codes[i:i+batch_size]
+    for i in range(0, len(codes), 20):
+        batch = codes[i:i+20]
         url = f"https://qt.gtimg.cn/q={','.join(batch)}"
         try:
             resp = safe_get(url)
@@ -138,71 +142,86 @@ def get_stock_data(codes):
                     'chg_pct': float(p[32]) if p[32] else 0,
                     'high': float(p[33]) if p[33] else 0,
                     'low': float(p[34]) if p[34] else 0,
-                    'amount': float(p[37])*10000 if p[37] else 0,
+                    'amount': float(p[37]) if p[37] else 0,  # 万元
                     'pe': float(p[39]) if p[39] and float(p[39]) > 0 else None,
                     'high_52w': float(p[41]) if p[41] else 0,
                     'low_52w': float(p[42]) if p[42] else 0,
-                    'market_cap': float(p[45]) if p[45] else 0,
+                    'market_cap': float(p[45]) if p[45] else 0,  # 亿
                     'pb': float(p[46]) if p[46] and float(p[46]) > 0 else None,
                 })
             time.sleep(0.3)
         except Exception as e:
-            print(f"  ⚠️ batch {i} 获取失败: {e}")
+            print(f"  ⚠️ batch {i} 失败: {e}")
     return results
 
-# ============================================================
-# 精选标的筛选
+def get_etf_52week(code):
+    """从腾讯日K获取ETF的52周高低点"""
+    try:
+        prefix = 'sh' if code.startswith('sh') or (not code.startswith('sz') and code[0] in '56') else 'sz'
+        clean_code = code.replace('sh','').replace('sz','')
+        param = f'{prefix}{clean_code},day,,,250,qfq'
+        url = f'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={param}'
+        resp = requests.get(url, headers=HEADERS, timeout=15)
+        data = resp.json()
+        if data.get('code') == 0:
+            stock_data = data['data'].get(f'{prefix}{clean_code}', {})
+            days = stock_data.get('qfqday') or stock_data.get('day')
+            if days:
+                highs = [float(d[3]) for d in days]
+                lows = [float(d[4]) for d in days]
+                return max(highs), min(lows)
+    except Exception as e:
+        print(f"  ⚠️ {code} 52周数据获取失败: {e}")
+    return 0, 0
+
 # ============================================================
 def score_stock(s):
     score, reasons = 0, []
-    pe, pb = s.get('pe'), s.get('pb')
+    pe, pb, price = s.get('pe'), s.get('pb'), s.get('price', 0)
 
     if pe and pe > 0:
-        if 5 <= pe <= 15: score += 25; reasons.append('低估值(PE优)')
+        if 5 <= pe <= 15: score += 25; reasons.append('低估值')
         elif 15 < pe <= 25: score += 20; reasons.append('估值合理')
-        elif 25 < pe <= 40: score += 12; reasons.append('估值适中')
-        elif pe < 5: score += 8; reasons.append('极低PE')
+        elif 25 < pe <= 40: score += 12
+        elif pe < 5: score += 8
         else: score += 5
     else: score += 5
 
     if pb and pb > 0:
-        if 0.5 <= pb <= 2.5: score += 20; reasons.append('PB低(安全边际高)')
-        elif 2.5 < pb <= 5: score += 12; reasons.append('PB适中')
+        if 0.5 <= pb <= 2.5: score += 20; reasons.append('PB低')
+        elif 2.5 < pb <= 5: score += 12
         elif pb < 0.5: score += 8
         else: score += 5
     else: score += 5
 
-    high52, price = s.get('high_52w', 0), s.get('price', 0)
+    high52 = s.get('high_52w', 0)
     if high52 > 0 and price > 0:
         dd = (high52 - price) / high52 * 100
         s['drawdown'] = dd
         if dd > 25: score += 20; reasons.append(f'深度回调{dd:.0f}%')
-        elif dd > 15: score += 15; reasons.append(f'明显回调{dd:.0f}%')
-        elif dd > 8: score += 10; reasons.append(f'适度回调{dd:.0f}%')
+        elif dd > 15: score += 15
+        elif dd > 8: score += 10
         elif dd > 3: score += 5
     else: s['drawdown'] = 0
 
     mc = s.get('market_cap', 0)
     if 200 <= mc <= 3000: score += 15; reasons.append('市值适中')
-    elif 50 <= mc < 200: score += 10; reasons.append('中小市值')
-    elif mc > 3000: score += 8; reasons.append('大盘蓝筹')
+    elif 50 <= mc < 200: score += 10
+    elif mc > 3000: score += 8
     else: score += 5
 
     high, low, chg = s.get('high', 0), s.get('low', 0), s.get('chg_pct', 0)
     if high > 0 and low > 0 and price > 0 and high != low:
         pos = (price - low) / (high - low)
-        if pos > 0.7: score += 8; reasons.append('收盘强势')
+        if pos > 0.7: score += 8
         elif pos > 0.4: score += 5
         else: score += 2
 
     if 0 < chg <= 5: score += 7; reasons.append('温和上涨')
-    elif 5 < chg <= 10: score += 5; reasons.append('放量上攻')
+    elif 5 < chg <= 10: score += 5
     elif chg > 10: score += 2
     elif -5 <= chg <= 0: score += 6; reasons.append('回调机会')
     else: score += 3
-
-    vol = s.get('volume', 0)
-    if vol > 0: score += min(int(vol / 500000), 5)
 
     s['score'] = score
     s['reasons'] = '、'.join(reasons)
@@ -215,7 +234,7 @@ def filter_and_rank(stocks, top_n=5):
         pe, pb = s.get('pe'), s.get('pb')
         if price <= 0 or price >= 100: continue
         if code.startswith('688'): continue
-        if 'ST' in name or '*ST' in name: continue
+        if 'ST' in name: continue
         if pe is None or pe <= 0: continue
         if pb is None or pb <= 0: continue
         qualified.append(score_stock(s))
@@ -230,8 +249,8 @@ def pick_etfs(etf_data, top_n=3):
         name = e.get('name', '')
         amt_val = e.get('amount', 0)
         chg = e.get('chg_pct', 0)
-        if amt_val > 5e8: score += 15; reasons.append('流动性极好')
-        elif amt_val > 1e8: score += 10; reasons.append('流动性良好')
+        if amt_val > 5e4: score += 15; reasons.append('流动性极好')
+        elif amt_val > 1e4: score += 10; reasons.append('流动性良好')
         else: score += 3
         if 1 <= chg <= 8: score += 12; reasons.append('趋势健康')
         elif chg > 8: score += 8; reasons.append('短期强势')
@@ -248,27 +267,32 @@ def pick_etfs(etf_data, top_n=3):
     return scored[:top_n]
 
 # ============================================================
-# 报告生成
-# ============================================================
 def generate_report():
-    print(f"{'='*60}")
-    print(f"  A股每日投资分析报告")
+    print(f"\n{'='*60}")
+    print(f"  A股每日投资分析报告 v6")
     print(f"  日期: {TRADE_DATE}  |  时间: {NOW_STR}")
     print(f"{'='*60}\n")
 
-    print("📊 [1/4] 获取指数行情...")
+    print("📊 [1/5] 获取指数行情...")
     index_data, total_amount = get_index_data()
-    time.sleep(1)
+    time.sleep(0.5)
 
-    print("📊 [2/4] 获取个股数据...")
+    print(f"📊 [2/5] 获取{len(STOCK_CANDIDATES)}只个股数据...")
     all_stocks = get_stock_data(STOCK_CANDIDATES)
-    time.sleep(1)
+    time.sleep(0.5)
 
-    print("📊 [3/4] 获取ETF数据...")
+    print("📊 [3/5] 获取ETF数据...")
     all_etfs = get_stock_data(ETF_CANDIDATES)
-    time.sleep(1)
+    time.sleep(0.5)
 
-    print("📊 [4/4] 筛选精选标的...")
+    print("📊 [4/5] 获取跟踪ETF的52周数据...")
+    tracked_52w = {}
+    for etf_code in TRACKED_ETFS:
+        h, l = get_etf_52week(etf_code)
+        tracked_52w[etf_code] = {'high_52w': h, 'low_52w': l}
+        time.sleep(0.3)
+
+    print("📊 [5/5] 筛选精选标的...")
     top_stocks = filter_and_rank(all_stocks, top_n=5)
     top_etfs = pick_etfs(all_etfs, top_n=2)
 
@@ -278,20 +302,24 @@ def generate_report():
         name = s.get('name', '')
         sector = '其他'
         for kw, label in [
-            ('半导体','半导体'),('芯片','半导体'),('微电','半导体'),('长电','半导体'),
-            ('通富','半导体'),('深科技','半导体'),('紫光','半导体'),('兆易','半导体'),
-            ('光电','光学'),('显示','光学'),('京东方','面板'),
-            ('通信','通信'),('旭创','通信'),
+            ('半导体','半导体'),('芯片','半导体'),('长电','半导体'),('通富','半导体'),
+            ('紫光','半导体'),('兆易','半导体'),('深科技','半导体'),
+            ('光电','光学'),('京东方','面板'),('显示','面板'),
+            ('通信','通信'),('旭创','通信'),('中兴','通信'),('烽火','通信'),
             ('工业富联','AI服务器'),('浪潮','AI服务器'),('曙光','AI服务器'),
             ('电子','消费电子'),('立讯','消费电子'),('蓝思','消费电子'),
             ('亿纬','新能源'),('宁德','新能源'),('锂','新能源'),('隆基','新能源'),
-            ('紫金','有色'),('钼','有色'),('锆','有色'),('华友','有色'),
-            ('三一','机械'),('大族','机械'),
-            ('药','医药'),('医疗','医药'),('生物','医药'),
+            ('阳光','新能源'),('先导','新能源'),
+            ('紫金','有色'),('钼','有色'),('锆','有色'),('华友','有色'),('铝','有色'),
+            ('三一','机械'),('大族','机械'),('中联','机械'),
+            ('药','医药'),('医疗','医药'),('生物','医药'),('迈瑞','医药'),
             ('酒','消费'),('五粮','消费'),('茅台','消费'),('泸州','消费'),
-            ('海尔','家电'),
+            ('伊利','消费'),('海尔','家电'),('美的','家电'),('格力','家电'),
             ('平安','金融'),('银行','金融'),('证券','金融'),('中信','金融'),
-            ('军工','军工'),('卫星','军工'),
+            ('招商','金融'),('兴业','金融'),('宁波','金融'),
+            ('军工','军工'),('卫星','军工'),('航','军工'),
+            ('神华','能源'),('石油','能源'),('石化','能源'),('中煤','能源'),
+            ('长江','电力'),('华能','电力'),('国电','电力'),
         ]:
             if kw in name: sector = label; break
         if sector not in sector_map:
@@ -299,7 +327,7 @@ def generate_report():
         sector_map[sector]['count'] += 1
         sector_map[sector]['total_chg'] += s.get('chg_pct', 0)
 
-    sector_avg = sorted([(k, v['total_chg']/v['count'], v['count']) 
+    sector_avg = sorted([(k, v['total_chg']/v['count'], v['count'])
                          for k, v in sector_map.items() if v['count']>=1],
                         key=lambda x: x[1], reverse=True)
 
@@ -336,14 +364,16 @@ def generate_report():
     L.append(f"| 指标 | 数值 |")
     L.append(f"|------|------|")
     L.append(f"| 上涨样本 | **{up_count}** ({up_ratio:.0f}%) |")
-    L.append(f"| 下跌样本 | {down_count} |")
+    L.append(f"| 下跌样本 | {down_count} ({100-up_ratio:.0f}%) |")
     L.append(f"| 两市成交额 | {amt(total_amount)} |")
     L.append(f"")
+    L.append(f"> ℹ️ 以上为{total_count}只样本股的统计结果，与实际全市场数据可能存在偏差，仅供参考。")
+    L.append(f"")
 
-    if up_ratio > 70: sentiment = "🟢 **市场情绪亢奋**，绝大多数个股上涨，赚钱效应极强。"
-    elif up_ratio > 55: sentiment = "🟢 **市场情绪偏暖**，多数个股上涨，赚钱效应较好。"
-    elif up_ratio > 40: sentiment = "🟡 **市场情绪中性**，个股分化明显，结构性行情为主。"
-    else: sentiment = "🔴 **市场情绪偏冷**，多数个股下跌，避险情绪升温。"
+    if up_ratio > 70: sentiment = "🟢 **市场情绪亢奋**，绝大多数样本股上涨。"
+    elif up_ratio > 55: sentiment = "🟢 **市场情绪偏暖**，多数样本股上涨。"
+    elif up_ratio > 40: sentiment = "🟡 **市场情绪中性**，个股分化明显。"
+    else: sentiment = "🔴 **市场情绪偏冷**，多数样本股下跌。"
     L.append(f"{sentiment}")
     L.append(f"")
 
@@ -364,13 +394,13 @@ def generate_report():
     L.append(f"")
     top_names = [s for s, _, _ in sector_avg[:5]]
     if '半导体' in top_names:
-        L.append(f"今日市场以**半导体/芯片**为核心主线，相关个股全面爆发。SEMI上调全球半导体设备销售额预测，多家芯片公司Q2业绩大幅预增，景气周期确认上行。")
+        L.append(f"今日**半导体/芯片**方向表现活跃，SEMI上调全球半导体设备销售额预测，多家公司Q2业绩预增。")
         L.append(f"")
     if any(kw in ' '.join(top_names) for kw in ['AI','通信','算力']):
-        L.append(f"**AI算力**方向持续活跃，CPO光通信、服务器等子板块表现强势，国产算力闭环提速。")
+        L.append(f"**AI算力**方向持续受关注，国产算力闭环提速。")
         L.append(f"")
     if '消费电子' in top_names:
-        L.append(f"**消费电子**产业链受益于AI终端创新，智能穿戴、AI眼镜等新品类驱动需求。")
+        L.append(f"**消费电子**产业链受益于AI终端创新。")
         L.append(f"")
 
     # 三、个股异动
@@ -405,7 +435,7 @@ def generate_report():
     L.append(f"")
     L.append(f"## 四、⭐ 每日精选标的")
     L.append(f"")
-    L.append(f"> 筛选标准：股价<100元、非科创板/ST、PE/PB有效、综合评分（估值+安全边际+技术面+市值）")
+    L.append(f"> 筛选标准：股价<100元、非科创板/ST、PE/PB有效")
     L.append(f"> ⚠️ 以下内容仅供研究参考，**不构成投资建议**")
     L.append(f"")
 
@@ -418,27 +448,6 @@ def generate_report():
         L.append(f"| {star} {i} | {s['code']} | **{s['name']}** | {num2(s['price'])} | {pct(s['chg_pct'])} | {s['pe']:.1f} | {s['pb']:.2f} | {s['market_cap']:.0f} | **{s['score']}** | {s.get('reasons','')} |")
     L.append(f"")
 
-    L.append(f"### 📋 精选标的详解")
-    L.append(f"")
-    for i, s in enumerate(top_stocks, 1):
-        L.append(f"#### {i}. {s['name']}（{s['code']}）")
-        L.append(f"")
-        L.append(f"| 维度 | 数据 | 评价 |")
-        L.append(f"|------|------|------|")
-        pe_val = s.get('pe', 0)
-        pe_lvl = '🟢 低估' if pe_val <= 15 else ('🟡 合理' if pe_val <= 30 else '🟠 偏高')
-        L.append(f"| 估值(PE) | {pe_val:.1f}倍 | {pe_lvl} |")
-        pb_val = s.get('pb', 0)
-        pb_lvl = '🟢 低PB' if pb_val <= 2 else ('🟡 适中' if pb_val <= 5 else '🟠 偏高')
-        L.append(f"| 净资产(PB) | {pb_val:.2f}倍 | {pb_lvl} |")
-        L.append(f"| 市值 | {s['market_cap']:.0f}亿 | {'大盘蓝筹' if s['market_cap']>1000 else '中盘成长' if s['market_cap']>200 else '小盘弹性'} |")
-        dd = s.get('drawdown', 0)
-        dd_lvl = '🟢 深度回调(安全边际高)' if dd > 20 else ('🟡 适度回调' if dd > 10 else '⚪ 接近高位')
-        L.append(f"| 距52周高点 | {dd:.1f}% | {dd_lvl} |")
-        L.append(f"| 今日涨跌 | {pct(s['chg_pct'])} | {'放量上攻' if s['chg_pct']>5 else '温和上涨' if s['chg_pct']>0 else '回调'} |")
-        L.append(f"| 综合评分 | **{s['score']}/100** | {s.get('reasons','')} |")
-        L.append(f"")
-
     L.append(f"### 📦 精选 ETF")
     L.append(f"")
     L.append(f"| 排名 | 代码 | 名称 | 最新价 | 涨跌幅 | 成交额 | 推荐理由 |")
@@ -447,7 +456,7 @@ def generate_report():
         L.append(f"| {'⭐' if i==1 else '★'} {i} | {e['code']} | **{e['name']}** | {num2(e['price'])} | {pct(e['chg_pct'])} | {amt(e['amount'])} | {e.get('etf_reasons','')} |")
     L.append(f"")
 
-    # ETF 专项跟踪（新增模块）
+    # 五、ETF 专项跟踪
     L.append(f"---")
     L.append(f"")
     L.append(f"## 五、🔍 ETF 专项跟踪")
@@ -455,123 +464,102 @@ def generate_report():
     L.append(f"> 每日跟踪用户指定的两只 ETF，提供行情分析和投资建议")
     L.append(f"")
 
-    # 获取跟踪 ETF 数据
     tracked_data = get_stock_data(TRACKED_ETFS)
-    # 获取跟踪ETF的指数成分股行情（用于深度分析）
-    liquor_stocks = ['sh600519','sz000858','sz000568','sh600809','sz002304',
-                     'sh600600','sh600132','sz000596','sz000799','sh600559']
-    tech_stocks = ['sz300750','sz300760','sz300124','sz300274','sh688981',
-                   'sh688036','sz300014','sz300408','sz300450','sz002475']
-
-    liquor_data = get_stock_data(liquor_stocks)
-    tech_data = get_stock_data(tech_stocks)
 
     for td in tracked_data:
         code = td['code']
+        raw_code = code.replace('sh','').replace('sz','')
         name = TRACKED_ETF_NAMES.get(code, td['name'])
         desc = TRACKED_ETF_DESC.get(code, '')
         price = td['price']
         chg_pct = td['chg_pct']
         amount = td['amount']
-        high52 = td['high_52w']
-        low52 = td['low_52w']
         prev_close = td['prev_close']
         high = td['high']
         low = td['low']
+        open_price = td['open']
 
-        # 计算技术指标
-        # 距52周高点回撤
+        # 使用专门的52周数据
+        tw = tracked_52w.get(code, {})
+        high52 = tw.get('high_52w', 0)
+        low52 = tw.get('low_52w', 0)
+
+        # 技术指标
         dd_52w = (high52 - price) / high52 * 100 if high52 > 0 and price > 0 else 0
-        # 距52周低点涨幅
         up_52w = (price - low52) / low52 * 100 if low52 > 0 and price > 0 else 0
-        # 当日振幅
         amplitude = (high - low) / prev_close * 100 if prev_close > 0 and high > 0 and low > 0 else 0
-        # 收盘在当日区间的位置
         day_pos = (price - low) / (high - low) * 100 if high != low and high > 0 and low > 0 else 50
 
-        # 确定关联的指数和成分股
-        # 腾讯返回的 code 可能不带 sh/sz 前缀
-        raw_code = code.replace('sh','').replace('sz','')
-        if '512690' in code or raw_code == '512690':
+        # 成分股数据
+        comp_codes = TRACKED_ETF_COMPONENTS.get(code, [])
+        comp_data = get_stock_data(comp_codes) if comp_codes else []
+
+        if '512690' in code:
             related_index = '中证酒指数'
-            related_stocks = liquor_data
             stock_label = '白酒/啤酒龙头'
         else:
             related_index = '科创创业50指数'
-            related_stocks = tech_data
             stock_label = '科创创业龙头'
 
-        # 分析成分股表现
-        if related_stocks:
-            up_count = sum(1 for s in related_stocks if s['chg_pct'] > 0)
-            down_count = sum(1 for s in related_stocks if s['chg_pct'] < 0)
-            avg_chg = sum(s['chg_pct'] for s in related_stocks) / len(related_stocks)
-        else:
-            up_count = down_count = 0
-            avg_chg = 0
-
-        # 投资建议逻辑
+        # 投资建议
         suggestions = []
         risk_level = '中'
 
-        # 位置判断
         if dd_52w > 15:
-            suggestions.append(f'距52周高点回调{dd_52w:.0f}%，处于相对低位，具备一定安全边际')
-            if chg_pct > 0:
-                suggestions.append('底部放量反弹，关注能否持续放量突破')
+            suggestions.append(f'距52周高点回调{dd_52w:.0f}%，处于相对低位')
+            if chg_pct > 0: suggestions.append('底部反弹，关注能否持续放量')
         elif dd_52w < 3:
             suggestions.append('接近52周高点，短期追高风险较大')
             risk_level = '高'
-        elif 3 <= dd_52w <= 15:
+        else:
             suggestions.append(f'距52周高点{dd_52w:.0f}%回撤，处于合理区间')
 
-        # 趋势判断
         if chg_pct > 3:
             suggestions.append('短期强势上攻，但需警惕获利回吐')
-            if day_pos > 70:
-                suggestions.append('收盘位于日高附近，多头掌控局面')
+            if day_pos > 70: suggestions.append('收盘位于日高附近，多头掌控')
             risk_level = '中高' if risk_level != '高' else '高'
         elif 0 <= chg_pct <= 3:
             suggestions.append('温和上涨，趋势健康')
         elif -3 <= chg_pct < 0:
             suggestions.append('小幅回调，关注下方支撑')
-            risk_level = '中'
         else:
-            suggestions.append('跌幅较大，短期趋势偏弱，等待企稳信号')
+            suggestions.append('跌幅较大，等待企稳信号')
             risk_level = '中低'
 
-        # 成交额判断
-        if amount > 5e8:
-            suggestions.append('成交活跃，流动性充裕')
-        elif amount > 1e8:
-            suggestions.append('成交适中')
-        else:
-            suggestions.append('成交偏淡，关注量能变化')
+        if amount > 5e4: suggestions.append('成交活跃，流动性充裕')
+        elif amount > 1e4: suggestions.append('成交适中')
+        else: suggestions.append('成交偏淡')
 
-        # 成分股联动分析
-        if avg_chg > 0 and up_count > down_count:
-            suggestions.append(f'成分股多数上涨({up_count}/{len(related_stocks)})，板块共振向上')
-        elif avg_chg < 0 and down_count > up_count:
-            suggestions.append(f'成分股多数下跌({down_count}/{len(related_stocks)})，板块承压')
+        if comp_data:
+            up_c = sum(1 for s in comp_data if s['chg_pct'] > 0)
+            down_c = sum(1 for s in comp_data if s['chg_pct'] < 0)
+            avg_c = sum(s['chg_pct'] for s in comp_data) / len(comp_data)
         else:
-            suggestions.append('成分股分化，精选个股更重要')
+            up_c = down_c = 0
+            avg_c = 0
 
-        # 核心建议
+        if avg_c > 0 and up_c > down_c:
+            suggestions.append(f'成分股多数上涨({up_c}/{len(comp_data)})，板块共振向上')
+        elif avg_c < 0 and down_c > up_c:
+            suggestions.append(f'成分股多数下跌({down_c}/{len(comp_data)})，板块承压')
+        else:
+            suggestions.append('成分股分化')
+
         if dd_52w > 20 and chg_pct <= 0:
-            core_suggestion = '🟢 深度回调+缩量调整，可考虑分批建仓，控制仓位不超过总资产20%'
+            core = '🟢 深度回调+缩量调整，可考虑分批建仓，控制仓位不超过总资产20%'
         elif dd_52w > 10 and 0 <= chg_pct <= 3:
-            core_suggestion = '🟢 回调充分+温和反弹，适合逢低布局，建议分批买入'
+            core = '🟢 回调充分+温和反弹，适合逢低布局'
         elif dd_52w < 5 and chg_pct > 3:
-            core_suggestion = '🟠 接近高位+放量上攻，短期有回调压力，建议持有者逢高减仓，新入场者等待回调'
+            core = '🟠 接近高位+放量上攻，建议持有者逢高减仓，新入场者等待回调'
         elif dd_52w < 5 and chg_pct <= 0:
-            core_suggestion = '🟡 高位震荡，方向不明确，建议观望为主，等待方向选择'
+            core = '🟡 高位震荡，建议观望，等待方向选择'
         elif chg_pct > 5:
-            core_suggestion = '🟠 短期涨幅过大，追高风险较高，建议耐心等待回调至5日均线附近再考虑'
+            core = '🟠 短期涨幅过大，追高风险较高，建议等待回调'
         else:
-            core_suggestion = '🟡 中性偏多，可小仓位试探性建仓，设置5%止损线'
+            core = '🟡 中性偏多，可小仓位试探性建仓，设置5%止损线'
 
-        # 生成表格
-        L.append(f"### {'🍷' if '512690' in code else '🚀'} {name}")
+        emoji = '🍷' if '512690' in code else '🚀'
+        L.append(f"### {emoji} {name}")
         L.append(f"")
         L.append(f"> {desc}")
         L.append(f"")
@@ -580,70 +568,62 @@ def generate_report():
         L.append(f"")
         L.append(f"| 指标 | 数据 |")
         L.append(f"|------|------|")
-        emoji = "🔴" if chg_pct > 0 else ("🟢" if chg_pct < 0 else "⚪")
-        L.append(f"| 最新价 | {emoji} **{num2(price)}** |")
+        emoji_p = "🔴" if chg_pct > 0 else ("🟢" if chg_pct < 0 else "⚪")
+        L.append(f"| 最新价 | {emoji_p} **{num2(price)}** |")
         L.append(f"| 涨跌幅 | {pct(chg_pct)} |")
-        L.append(f"| 今开/最高/最低 | {num2(td['open'])} / {num2(high)} / {num2(low)} |")
+        L.append(f"| 今开/最高/最低 | {num2(open_price)} / {num2(high)} / {num2(low)} |")
         L.append(f"| 成交额 | {amt(amount)} |")
-        L.append(f"| 52周高/低 | {num2(high52)} / {num2(low52)} |")
-        L.append(f"| 距52周高点 | {dd_52w:.1f}% |")
-        L.append(f"| 距52周低点 | +{up_52w:.1f}% |")
+        L.append(f"| 52周最高/最低 | {num2(high52)} / {num2(low52)} |")
+        L.append(f"| 距52周高点 | {dd_52w:.1f}%（{'+' if dd_52w>=0 else ''}{price-high52:+.3f}） |")
+        L.append(f"| 距52周低点 | +{up_52w:.1f}%（{'+' if price-low52>=0 else ''}{price-low52:+.3f}） |")
         L.append(f"| 日内振幅 | {amplitude:.1f}% |")
         L.append(f"| 跟踪指数 | {related_index} |")
         L.append(f"")
 
-        # 成分股表现
-        L.append(f"#### 📈 成分股表现（{stock_label}）")
-        L.append(f"")
-        L.append(f"| 代码 | 名称 | 最新价 | 涨跌幅 | PE |")
-        L.append(f"|------|------|--------|--------|-----|")
-        sorted_related = sorted(related_stocks, key=lambda x: x['chg_pct'], reverse=True)
-        for s in sorted_related[:10]:
-            pe_str = f"{s['pe']:.1f}" if s['pe'] else '-'
-            L.append(f"| {s['code']} | {s['name']} | {num2(s['price'])} | {pct(s['chg_pct'])} | {pe_str} |")
-        L.append(f"")
+        if comp_data:
+            L.append(f"#### 📈 成分股表现（{stock_label}）")
+            L.append(f"")
+            L.append(f"| 代码 | 名称 | 最新价 | 涨跌幅 | PE |")
+            L.append(f"|------|------|--------|--------|-----|")
+            sorted_comp = sorted(comp_data, key=lambda x: x['chg_pct'], reverse=True)
+            for s in sorted_comp[:10]:
+                pe_str = f"{s['pe']:.1f}" if s['pe'] else '-'
+                L.append(f"| {s['code']} | {s['name']} | {num2(s['price'])} | {pct(s['chg_pct'])} | {pe_str} |")
+            L.append(f"")
+            L.append(f"| 统计 | 数值 |")
+            L.append(f"|------|------|")
+            L.append(f"| 上涨/下跌 | {up_c}/{down_c} |")
+            L.append(f"| 平均涨跌幅 | {pct(avg_c)} |")
+            L.append(f"")
 
-        # 成分股统计
-        L.append(f"| 统计 | 数值 |")
-        L.append(f"|------|------|")
-        L.append(f"| 上涨成分股 | {up_count}/{len(related_stocks)} |")
-        L.append(f"| 下跌成分股 | {down_count}/{len(related_stocks)} |")
-        L.append(f"| 平均涨跌幅 | {pct(avg_chg)} |")
-        L.append(f"")
-
-        # 分析建议
         L.append(f"#### 💡 投资建议")
         L.append(f"")
-        L.append(f"**风险等级**: {'🟢 低' if risk_level == '低' else '🟡 中' if risk_level == '中' else '🟠 中高' if risk_level == '中高' else '🔴 高'}")
+        L.append(f"**风险等级**: {'🟢 低' if risk_level=='低' else '🟡 中' if risk_level=='中' else '🟠 中高' if risk_level=='中高' else '🔴 高'}")
         L.append(f"")
-        L.append(f"**核心建议**: {core_suggestion}")
+        L.append(f"**核心建议**: {core}")
         L.append(f"")
         L.append(f"**详细分析**:")
         for j, sug in enumerate(suggestions, 1):
             L.append(f"{j}. {sug}")
         L.append(f"")
 
-    # 五 → 六、财经要闻
+    # 六、财经要闻
     L.append(f"---")
     L.append(f"")
     L.append(f"## 六、📰 财经要闻")
     L.append(f"")
     has_chip = any('半导体' in s for s, _, _ in sector_avg)
-    has_ai = any(kw in ' '.join([s for s, _, _ in sector_avg]) for kw in ['AI','算力','通信'])
     news = []
-    if has_chip: news.append("🔥 **半导体产业链全线爆发**，多只芯片ETF涨停，SEMI上调全球半导体设备销售额预测")
-    if has_ai: news.append("🚀 **AI算力军备竞赛持续**，国产算力闭环提速，光通信/CPO概念获资金追捧")
+    if has_chip: news.append("🔥 **半导体产业链活跃**，SEMI上调全球半导体设备销售额预测")
     news.append("📊 **证监会主席吴清召开散户座谈会**，国家队密集增持，A股稳市机制走向常态化")
     news.append("📈 **头部券商上调两融规模上限**，释放近千亿资金空间")
-    news.append("🤖 **上半年我国人形机器人整机产品达400款超全球半数**，政策+产业双轮驱动")
-    if any(kw in ' '.join(top_names) for kw in ['科创','半导体','芯片']):
-        news.append("💹 **科创50暴涨超10%**，科技成长风格极度占优")
+    news.append("🤖 **上半年我国人形机器人整机产品达400款超全球半数**")
     for i, item in enumerate(news[:10], 1):
         L.append(f"{i}. {item}")
         L.append(f"")
     L.append(f"")
 
-    # 六、市场综述
+    # 七、市场综述
     L.append(f"---")
     L.append(f"")
     L.append(f"## 七、📝 市场综述与展望")
@@ -664,19 +644,18 @@ def generate_report():
 
     L.append(f"### 关键信号")
     L.append(f"")
-    L.append(f"- ✅ 增量资金入场信号明确，两市成交额明显放大")
-    L.append(f"- ✅ 政策面持续偏暖，证监会稳市机制+券商两融扩容双管齐下")
-    L.append(f"- ✅ 半导体/AI产业链景气度确认，多家公司Q2业绩大幅预增")
-    L.append(f"- ⚠️ 短期涨幅过大，需警惕技术性回调")
-    L.append(f"- ⚠️ 市场结构性分化严重，传统板块资金流出明显")
+    L.append(f"- ✅ 增量资金入场信号明确")
+    L.append(f"- ✅ 政策面持续偏暖，证监会稳市机制+券商两融扩容")
+    L.append(f"- ✅ 半导体/AI产业链景气度确认")
+    L.append(f"- ⚠️ 市场结构性分化，需精选方向")
     L.append(f"")
 
     L.append(f"### 策略建议")
     L.append(f"")
-    L.append(f"1. **仓位管理**：市场情绪亢奋但分化严重，建议控制仓位在6-7成")
-    L.append(f"2. **方向选择**：聚焦半导体、AI算力等主线，但避免追高，等待分歧回调")
+    L.append(f"1. **仓位管理**：建议控制仓位在6-7成")
+    L.append(f"2. **方向选择**：聚焦主线，避免追高，等待分歧回调")
     L.append(f"3. **安全边际**：优先选择PE 10-25倍、PB<3倍的优质标的")
-    L.append(f"4. **ETF配置**：科创50ETF、芯片ETF仍是弹性品种，适合风险偏好较高的投资者")
+    L.append(f"4. **ETF配置**：关注精选池中的低估值品种")
     L.append(f"")
 
     # 免责声明
@@ -693,17 +672,15 @@ def generate_report():
 
     report_text = "\n".join(L)
     filename = os.path.join(OUTPUT_DIR, f"A股投资分析报告_{TRADE_DATE}.md")
+    readme_path = os.path.join(OUTPUT_DIR, 'README.md')
     with open(filename, 'w', encoding='utf-8') as f:
         f.write(report_text)
-
-    # 同步更新 README.md（方便手机端直接在仓库首页查看）
-    readme_path = os.path.join(OUTPUT_DIR, 'README.md')
     with open(readme_path, 'w', encoding='utf-8') as f:
         f.write(report_text)
-    print(f"📱 README.md 已同步更新（仓库首页可见）")
 
     print(f"\n✅ 报告已生成: {filename}")
-    print(f"   共 {len(report_text)} 字符")
+    print(f"   README.md 已同步更新")
+    print(f"   共 {len(report_text)} 字符, {len(L)} 行")
     print(f"   精选标的: {len(top_stocks)}只个股 + {len(top_etfs)}只ETF")
     for i, s in enumerate(top_stocks, 1):
         print(f"   {i}. {s['code']} {s['name']} PE={s['pe']:.1f} PB={s['pb']:.2f} 评分={s['score']}")

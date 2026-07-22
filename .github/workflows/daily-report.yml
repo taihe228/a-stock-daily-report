@@ -1,0 +1,55 @@
+name: A股每日投资分析报告
+
+on:
+  schedule:
+    # 北京时间每晚 20:00 (UTC+8 = UTC 12:00)
+    # 周一到周五运行
+    - cron: '0 12 * * 1-5'
+  
+  # 允许手动触发
+  workflow_dispatch:
+
+jobs:
+  generate-report:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+      
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+      
+      - name: 生成报告
+        run: |
+          mkdir -p output
+          OUTPUT_DIR="$PWD/output" python report.py
+      
+      - name: 上传报告
+        uses: actions/upload-artifact@v4
+        with:
+          name: A股投资分析报告
+          path: output/A股投资分析报告_*.md
+          retention-days: 30
+      
+      - name: 提交报告到仓库
+        run: |
+          git config --global user.name "WorkBuddy Bot"
+          git config --global user.email "bot@workbuddy.ai"
+          
+          # 将报告复制到 reports/ 目录
+          mkdir -p reports
+          cp output/A股投资分析报告_*.md reports/ 2>/dev/null || true
+          
+          git add reports/ 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "没有新报告需要提交"
+          else
+            git commit -m "📊 自动生成 $(date +%Y-%m-%d) A股投资分析报告"
+            git push
+          fi

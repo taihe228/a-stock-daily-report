@@ -155,30 +155,59 @@ def get_stock_data(codes):
     return results
 
 def get_etf_52week(code):
-    """从腾讯日K获取ETF的52周高低点（含重试和备用API）"""
+    """获取ETF的52周高低点（三重备用API：腾讯→新浪→东方财富）"""
     prefix = 'sh' if code.startswith('sh') or (not code.startswith('sz') and code[0] in '56') else 'sz'
     clean_code = code.replace('sh','').replace('sz','')
-    # 尝试两个API端点 + 重试
-    urls = [
+    sina_code = f'{prefix}{clean_code}'
+    # 东方财富 secid: 1=沪 0=深
+    em_secid = f'1.{clean_code}' if prefix == 'sh' else f'0.{clean_code}'
+
+    # 方法1: 腾讯日K API
+    for url in [
         f'https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix}{clean_code},day,,,250,qfq',
         f'https://ifzq.gtimg.cn/appstock/app/fqkline/get?param={prefix}{clean_code},day,,,250,qfq',
-    ]
-    for url in urls:
-        for attempt in range(3):
-            try:
-                resp = requests.get(url, headers=HEADERS, timeout=20)
-                data = resp.json()
-                if data.get('code') == 0:
-                    stock_data = data['data'].get(f'{prefix}{clean_code}', {})
-                    days = stock_data.get('qfqday') or stock_data.get('day')
-                    if days and len(days) > 0:
-                        highs = [float(d[3]) for d in days]
-                        lows = [float(d[4]) for d in days]
-                        return max(highs), min(lows)
-            except Exception as e:
-                print(f"  ⚠️ {code} 52周数据尝试{attempt+1}失败: {e}")
-                time.sleep(1)
-        # 换下一个URL
+    ]:
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=15)
+            data = resp.json()
+            if data.get('code') == 0:
+                stock_data = data['data'].get(f'{prefix}{clean_code}', {})
+                days = stock_data.get('qfqday') or stock_data.get('day')
+                if days and len(days) > 0:
+                    highs = [float(d[3]) for d in days]
+                    lows = [float(d[4]) for d in days]
+                    print(f"  ✅ {code} 52周数据(腾讯): high={max(highs):.3f}, low={min(lows):.3f}")
+                    return max(highs), min(lows)
+        except Exception as e:
+            print(f"  ⚠️ {code} 腾讯API失败: {e}")
+
+    # 方法2: 新浪API
+    try:
+        sina_url = f'https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={sina_code}&scale=240&ma=no&datalen=250'
+        resp = requests.get(sina_url, headers=HEADERS, timeout=15)
+        data = resp.json()
+        if data and len(data) > 0:
+            highs = [float(x['high']) for x in data]
+            lows = [float(x['low']) for x in data]
+            print(f"  ✅ {code} 52周数据(新浪): high={max(highs):.3f}, low={min(lows):.3f}")
+            return max(highs), min(lows)
+    except Exception as e:
+        print(f"  ⚠️ {code} 新浪API失败: {e}")
+
+    # 方法3: 东方财富API
+    try:
+        em_url = f'https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={em_secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57&klt=101&fqt=1&beg=20250101&end=20261231&lmt=250'
+        resp = requests.get(em_url, headers=HEADERS, timeout=15)
+        data = resp.json()
+        klines = data.get('data', {}).get('klines', [])
+        if klines and len(klines) > 0:
+            highs = [float(k.split(',')[2]) for k in klines]
+            lows = [float(k.split(',')[3]) for k in klines]
+            print(f"  ✅ {code} 52周数据(东方财富): high={max(highs):.3f}, low={min(lows):.3f}")
+            return max(highs), min(lows)
+    except Exception as e:
+        print(f"  ⚠️ {code} 东方财富API失败: {e}")
+
     print(f"  ❌ {code} 52周数据全部获取失败")
     return 0, 0
 

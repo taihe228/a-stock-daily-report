@@ -696,6 +696,12 @@ def generate_report():
     with open(filename, 'w', encoding='utf-8') as f:
         f.write(report_text)
 
+    # 同步更新 README.md（方便手机端直接在仓库首页查看）
+    readme_path = os.path.join(OUTPUT_DIR, 'README.md')
+    with open(readme_path, 'w', encoding='utf-8') as f:
+        f.write(report_text)
+    print(f"📱 README.md 已同步更新（仓库首页可见）")
+
     print(f"\n✅ 报告已生成: {filename}")
     print(f"   共 {len(report_text)} 字符")
     print(f"   精选标的: {len(top_stocks)}只个股 + {len(top_etfs)}只ETF")

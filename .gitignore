@@ -5,8 +5,8 @@ __pycache__/
 .env
 .venv/
 
-# 报告输出
-reports/
+# 临时输出（但保留 reports/ 目录中的报告）
+output/
 
 # IDE
 .vscode/

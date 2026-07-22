@@ -48,7 +48,7 @@ jobs:
           mkdir -p reports
           cp output/A股投资分析报告_*.md reports/ 2>/dev/null || true
           
-          git add reports/ 2>/dev/null || true
+          git add -f reports/
           if git diff --cached --quiet; then
             echo "没有新报告需要提交"
           else

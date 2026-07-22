@@ -48,7 +48,14 @@ jobs:
           mkdir -p reports
           cp output/A股投资分析报告_*.md reports/ 2>/dev/null || true
           
-          git add -f reports/
+          # 同步报告到 README.md（手机打开仓库首页直接看到）
+          TODAY=$(date +%Y-%m-%d)
+          REPORT_FILE=$(ls output/A股投资分析报告_${TODAY}.md 2>/dev/null | head -1)
+          if [ -n "$REPORT_FILE" ]; then
+            cp "$REPORT_FILE" README.md
+          fi
+          
+          git add -f reports/ README.md
           if git diff --cached --quiet; then
             echo "没有新报告需要提交"
           else

@@ -28,7 +28,10 @@ jobs:
         run: pip install -r requirements.txt
       
       - name: 生成报告
+        env:
+          TZ: Asia/Shanghai
         run: |
+          echo "当前北京时间: $(date '+%Y-%m-%d %H:%M:%S %A')"
           mkdir -p output
           OUTPUT_DIR="$PWD/output" python report.py
       
@@ -40,7 +43,10 @@ jobs:
           retention-days: 30
       
       - name: 提交报告到仓库
+        env:
+          TZ: Asia/Shanghai
         run: |
+          echo "提交时间(北京时间): $(date '+%Y-%m-%d %H:%M:%S')"
           git config --global user.name "WorkBuddy Bot"
           git config --global user.email "bot@workbuddy.ai"
           

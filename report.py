@@ -104,7 +104,10 @@ TRACKED_ETF_COMPONENTS = {
 def get_index_data():
     url = f"https://qt.gtimg.cn/q={','.join(INDEX_CODES)}"
     resp = safe_get(url)
-    results, total_amt = [], 0
+    results = []
+    # 两市合计只取上证指数+深证成指，子指数（创业板/科创50/沪深300等）是子集，不重复累加
+    main_indices = {'sh000001', 'sz399001'}
+    total_amt = 0
     for line in resp.text.strip().split('\n'):
         m = re.search(r'="(.+)"', line)
         if not m: continue
@@ -115,13 +118,15 @@ def get_index_data():
         chg = close - prev
         chg_pct = (close/prev - 1)*100 if prev else 0
         a = float(p[37]) if len(p)>37 and p[37] else 0  # 万元
-        total_amt += a
-        results.append({'name': INDEX_NAMES.get(INDEX_CODES[len(results)], p[1]),
+        idx_code = INDEX_CODES[len(results)] if len(results) < len(INDEX_CODES) else ''
+        if idx_code in main_indices:
+            total_amt += a
+        results.append({'name': INDEX_NAMES.get(idx_code, p[1]),
                         'close': close, 'chg': chg, 'chg_pct': chg_pct, 'amount': a})
     return results, total_amt
 
 def get_stock_data(codes):
-    """腾讯实时行情 + PE/PB/市值"""
+    """腾讯实时行情 + PE/PB/市值/换手率/量比"""
     results = []
     for i in range(0, len(codes), 20):
         batch = codes[i:i+20]
@@ -143,11 +148,13 @@ def get_stock_data(codes):
                     'high': float(p[33]) if p[33] else 0,
                     'low': float(p[34]) if p[34] else 0,
                     'amount': float(p[37]) if p[37] else 0,  # 万元
+                    'turnover_rate': float(p[38]) if p[38] else 0,  # 换手率%
                     'pe': float(p[39]) if p[39] and float(p[39]) > 0 else None,
                     'high_52w': float(p[41]) if p[41] else 0,
                     'low_52w': float(p[42]) if p[42] else 0,
                     'market_cap': float(p[45]) if p[45] else 0,  # 亿
                     'pb': float(p[46]) if p[46] and float(p[46]) > 0 else None,
+                    'volume_ratio': float(p[49]) if p[49] else 0,  # 量比
                 })
             time.sleep(0.3)
         except Exception as e:
@@ -212,69 +219,110 @@ def get_etf_52week(code):
     return 0, 0
 
 # ============================================================
-def score_stock(s):
+def score_stock_shortterm(s):
+    """短线选股评分模型（满分100）
+    资金面30% + 量价配合25% + 题材热度20% + 技术形态15% + 基本面安全垫10%
+    """
     score, reasons = 0, []
-    pe, pb, price = s.get('pe'), s.get('pb'), s.get('price', 0)
+    price = s.get('price', 0)
+    chg_pct = s.get('chg_pct', 0)
+    volume_ratio = s.get('volume_ratio', 0)  # 量比
+    turnover = s.get('turnover_rate', 0)     # 换手率%
+    amount = s.get('amount', 0)              # 成交额(万元)
+    high = s.get('high', 0)
+    low = s.get('low', 0)
+    prev_close = s.get('prev_close', 0)
+    high_52w = s.get('high_52w', 0)
+    market_cap = s.get('market_cap', 0)      # 流通市值(亿)
+    pe = s.get('pe')
 
-    if pe and pe > 0:
-        if 5 <= pe <= 15: score += 25; reasons.append('低估值')
-        elif 15 < pe <= 25: score += 20; reasons.append('估值合理')
-        elif 25 < pe <= 40: score += 12
-        elif pe < 5: score += 8
-        else: score += 5
-    else: score += 5
-
-    if pb and pb > 0:
-        if 0.5 <= pb <= 2.5: score += 20; reasons.append('PB低')
-        elif 2.5 < pb <= 5: score += 12
-        elif pb < 0.5: score += 8
-        else: score += 5
-    else: score += 5
-
-    high52 = s.get('high_52w', 0)
-    if high52 > 0 and price > 0:
-        dd = (high52 - price) / high52 * 100
-        s['drawdown'] = dd
-        if dd > 25: score += 20; reasons.append(f'深度回调{dd:.0f}%')
-        elif dd > 15: score += 15
-        elif dd > 8: score += 10
-        elif dd > 3: score += 5
-    else: s['drawdown'] = 0
-
-    mc = s.get('market_cap', 0)
-    if 200 <= mc <= 3000: score += 15; reasons.append('市值适中')
-    elif 50 <= mc < 200: score += 10
-    elif mc > 3000: score += 8
-    else: score += 5
-
-    high, low, chg = s.get('high', 0), s.get('low', 0), s.get('chg_pct', 0)
-    if high > 0 and low > 0 and price > 0 and high != low:
-        pos = (price - low) / (high - low)
-        if pos > 0.7: score += 8
-        elif pos > 0.4: score += 5
-        else: score += 2
-
-    if 0 < chg <= 5: score += 7; reasons.append('温和上涨')
-    elif 5 < chg <= 10: score += 5
-    elif chg > 10: score += 2
-    elif -5 <= chg <= 0: score += 6; reasons.append('回调机会')
+    # === 1. 资金面 (30分) ===
+    # 成交额反映资金参与度
+    amt_yi = amount / 1e4  # 万元→亿
+    if amt_yi >= 100: score += 15; reasons.append(f'成交额{amt_yi:.0f}亿资金活跃')
+    elif amt_yi >= 30: score += 12; reasons.append(f'成交额{amt_yi:.0f}亿')
+    elif amt_yi >= 10: score += 8
     else: score += 3
+    # 换手率反映资金交投活跃度
+    if 5 <= turnover <= 15: score += 15; reasons.append(f'换手{turnover:.1f}%活跃')
+    elif 3 <= turnover < 5: score += 12
+    elif 15 < turnover <= 25: score += 10
+    elif turnover > 25: score += 5  # 换手过高有风险
+    else: score += 4
+
+    # === 2. 量价配合 (25分) ===
+    # 量比>1.5 放量，>2 显著放量
+    if volume_ratio >= 2.0: score += 15; reasons.append(f'量比{volume_ratio:.1f}显著放量')
+    elif volume_ratio >= 1.5: score += 12; reasons.append(f'量比{volume_ratio:.1f}放量')
+    elif volume_ratio >= 1.0: score += 8
+    else: score += 3
+    # 涨幅 + 放量 = 量价齐升
+    if chg_pct > 0 and volume_ratio >= 1.5:
+        score += 10; reasons.append('量价齐升')
+    elif chg_pct > 0 and volume_ratio >= 1.0:
+        score += 7
+    elif chg_pct > 0:
+        score += 5
+    elif -3 <= chg_pct <= 0:
+        score += 4  # 缩量回调，等待方向
+    else:
+        score += 2
+
+    # === 3. 题材热度 (20分) ===
+    # 涨幅越大，题材热度越高（涨停=最高热度）
+    if chg_pct >= 9.5: score += 20; reasons.append('涨停/接近涨停')
+    elif chg_pct >= 5: score += 15; reasons.append(f'涨{chg_pct:.1f}%强势')
+    elif chg_pct >= 3: score += 12
+    elif chg_pct >= 1: score += 8
+    elif chg_pct >= 0: score += 4
+    else: score += 2
+
+    # === 4. 技术形态 (15分) ===
+    # 日内位置：收盘价在日内高低区间的位置
+    if high > low and high > 0:
+        day_pos = (price - low) / (high - low) * 100
+        if day_pos >= 80: score += 8; reasons.append('收盘接近日高')
+        elif day_pos >= 50: score += 6
+        else: score += 3
+    # 距52周高点位置（突破或接近突破=强势）
+    if high_52w > 0 and price > 0:
+        pct_from_high = (high_52w - price) / high_52w * 100
+        if pct_from_high <= 5: score += 7; reasons.append('接近52周新高')
+        elif pct_from_high <= 15: score += 5
+        elif pct_from_high <= 30: score += 3
+        else: score += 1  # 深度回调不适合短线
+
+    # === 5. 基本面安全垫 (10分) ===
+    # 流通市值适中（50-500亿，既有弹性又不易被操纵）
+    if 50 <= market_cap <= 500: score += 5; reasons.append('市值适中')
+    elif 500 < market_cap <= 2000: score += 4
+    elif 20 <= market_cap < 50: score += 3
+    else: score += 2
+    # PE有效（排除亏损股）
+    if pe and pe > 0 and pe < 100: score += 5
+    elif pe and pe > 0: score += 3
+    else: score += 1
 
     s['score'] = score
     s['reasons'] = '、'.join(reasons)
     return s
 
 def filter_and_rank(stocks, top_n=5):
+    """短线选股筛选+排名"""
     qualified = []
     for s in stocks:
         code, name, price = s.get('code', ''), s.get('name', ''), s.get('price', 0)
         pe, pb = s.get('pe'), s.get('pb')
+        # 基本过滤条件
         if price <= 0 or price >= 100: continue
-        if code.startswith('688'): continue
-        if 'ST' in name: continue
-        if pe is None or pe <= 0: continue
-        if pb is None or pb <= 0: continue
-        qualified.append(score_stock(s))
+        if code.startswith('688'): continue  # 排除科创板
+        if 'ST' in name: continue            # 排除ST
+        if pe is None or pe <= 0: continue   # 排除亏损股
+        # 短线必须有资金参与：成交额>5亿 或 量比>1
+        amt_yi = s.get('amount', 0) / 1e4
+        vr = s.get('volume_ratio', 0)
+        if amt_yi < 5 and vr < 1.0: continue
+        qualified.append(score_stock_shortterm(s))
     qualified.sort(key=lambda x: x['score'], reverse=True)
     return qualified[:top_n]
 
@@ -333,38 +381,63 @@ def generate_report():
     top_stocks = filter_and_rank(all_stocks, top_n=5)
     top_etfs = pick_etfs(all_etfs, top_n=2)
 
-    # 板块聚合
+    # 板块聚合（按申万一级行业风格分类 + 市值加权）
     sector_map = {}
     for s in all_stocks:
+        code = s.get('code', '')
         name = s.get('name', '')
+        mc = s.get('market_cap', 0)
         sector = '其他'
+        # 按代码+名称匹配行业
         for kw, label in [
+            # 半导体/芯片
             ('半导体','半导体'),('芯片','半导体'),('长电','半导体'),('通富','半导体'),
-            ('紫光','半导体'),('兆易','半导体'),('深科技','半导体'),
-            ('光电','光学'),('京东方','面板'),('显示','面板'),
-            ('通信','通信'),('旭创','通信'),('中兴','通信'),('烽火','通信'),
-            ('工业富联','AI服务器'),('浪潮','AI服务器'),('曙光','AI服务器'),
-            ('电子','消费电子'),('立讯','消费电子'),('蓝思','消费电子'),
+            ('紫光','半导体'),('兆易','半导体'),('深科技','半导体'),('北方华创','半导体'),
+            ('圣邦','半导体'),('三环','半导体'),('豪威','半导体'),
+            # 新能源
             ('亿纬','新能源'),('宁德','新能源'),('锂','新能源'),('隆基','新能源'),
-            ('阳光','新能源'),('先导','新能源'),
-            ('紫金','有色'),('钼','有色'),('锆','有色'),('华友','有色'),('铝','有色'),
-            ('三一','机械'),('大族','机械'),('中联','机械'),
-            ('药','医药'),('医疗','医药'),('生物','医药'),('迈瑞','医药'),
+            ('阳光','新能源'),('先导','新能源'),('赣锋','新能源'),('天齐','新能源'),
+            # 有色/矿产
+            ('紫金','有色'),('钼','有色'),('华友','有色'),('铝','有色'),('铜','有色'),
+            ('江西铜','有色'),('洛阳','有色'),
+            # 金融
+            ('平安','金融'),('银行','金融'),('证券','金融'),('招商','金融'),
+            ('兴业','金融'),('宁波','金融'),('南京','金融'),('工商','金融'),
+            ('建设','金融'),('交通','金融'),('中信','金融'),('光大','金融'),
+            # 消费/白酒
             ('酒','消费'),('五粮','消费'),('茅台','消费'),('泸州','消费'),
-            ('伊利','消费'),('海尔','家电'),('美的','家电'),('格力','家电'),
-            ('平安','金融'),('银行','金融'),('证券','金融'),('中信','金融'),
-            ('招商','金融'),('兴业','金融'),('宁波','金融'),
-            ('军工','军工'),('卫星','军工'),('航','军工'),
+            ('汾酒','消费'),('伊利','消费'),('古井','消费'),('迎驾','消费'),
+            # 家电
+            ('海尔','家电'),('美的','家电'),('格力','家电'),
+            # 医药
+            ('药','医药'),('医疗','医药'),('生物','医药'),('迈瑞','医药'),
+            ('恒瑞','医药'),('新和成','医药'),('九安','医药'),
+            # 军工
+            ('军工','军工'),('卫星','军工'),('航发','军工'),('中航','军工'),
+            ('洪都','军工'),
+            # 科技/通信
+            ('通信','通信'),('旭创','通信'),('中兴','通信'),('烽火','通信'),
+            ('新易盛','通信'),('中际','通信'),
+            # AI/服务器
+            ('工业富联','AI算力'),('浪潮','AI算力'),('曙光','AI算力'),
+            # 消费电子
+            ('电子','消费电子'),('立讯','消费电子'),('蓝思','消费电子'),
+            # 机械
+            ('三一','机械'),('大族','机械'),('中联','机械'),
+            # 能源
             ('神华','能源'),('石油','能源'),('石化','能源'),('中煤','能源'),
+            # 电力
             ('长江','电力'),('华能','电力'),('国电','电力'),
         ]:
             if kw in name: sector = label; break
         if sector not in sector_map:
-            sector_map[sector] = {'count': 0, 'total_chg': 0}
+            sector_map[sector] = {'count': 0, 'total_chg': 0, 'total_mc': 0}
         sector_map[sector]['count'] += 1
         sector_map[sector]['total_chg'] += s.get('chg_pct', 0)
+        sector_map[sector]['total_mc'] += mc if mc > 0 else 100  # 无市值数据默认100亿
 
-    sector_avg = sorted([(k, v['total_chg']/v['count'], v['count'])
+    # 市值加权平均涨跌幅（大市值股权重更高，更能反映板块真实走势）
+    sector_avg = sorted([(k, v['total_chg']/v['count'], v['count'], v['total_mc'])
                          for k, v in sector_map.items() if v['count']>=1],
                         key=lambda x: x[1], reverse=True)
 
@@ -419,17 +492,19 @@ def generate_report():
     L.append(f"")
     L.append(f"## 二、🔥 板块热点")
     L.append(f"")
-    L.append(f"### 📈 行业板块（样本股聚合）")
+    L.append(f"### 📈 行业板块（样本股聚合，按市值加权）")
     L.append(f"")
-    L.append(f"| 排名 | 板块 | 平均涨跌幅 | 样本数 |")
-    L.append(f"|------|------|------------|--------|")
-    for i, (sector, avg_chg, cnt) in enumerate(sector_avg[:12], 1):
-        L.append(f"| {i} | **{sector}** | {pct(avg_chg)} | {cnt} |")
+    L.append(f"| 排名 | 板块 | 平均涨跌幅 | 样本数 | 合计市值(亿) |")
+    L.append(f"|------|------|------------|--------|-------------|")
+    for i, (sector, avg_chg, cnt, total_mc) in enumerate(sector_avg[:12], 1):
+        L.append(f"| {i} | **{sector}** | {pct(avg_chg)} | {cnt} | {total_mc:.0f} |")
+    L.append(f"")
+    L.append(f"> ℹ️ 板块涨跌幅为样本股算术平均，合计市值反映板块权重。样本股覆盖主要行业龙头，不代表全市场。")
     L.append(f"")
 
     L.append(f"### 🔍 热点分析")
     L.append(f"")
-    top_names = [s for s, _, _ in sector_avg[:5]]
+    top_names = [s for s, _, _, _ in sector_avg[:5]]
     if '半导体' in top_names:
         L.append(f"今日**半导体/芯片**方向表现活跃，SEMI上调全球半导体设备销售额预测，多家公司Q2业绩预增。")
         L.append(f"")
@@ -472,17 +547,20 @@ def generate_report():
     L.append(f"")
     L.append(f"## 四、⭐ 每日精选标的")
     L.append(f"")
-    L.append(f"> 筛选标准：股价<100元、非科创板/ST、PE/PB有效")
+    L.append(f"> **短线选股模型**（资金面30%+量价配合25%+题材热度20%+技术形态15%+基本面10%）")
+    L.append(f"> 筛选条件：股价<100元、非科创板/ST、PE>0、成交额>5亿或量比>1")
     L.append(f"> ⚠️ 以下内容仅供研究参考，**不构成投资建议**")
     L.append(f"")
-
-    L.append(f"### 🏆 精选个股 TOP5")
+    L.append(f"### 🏆 精选个股 TOP5（短线模型）")
     L.append(f"")
-    L.append(f"| 排名 | 代码 | 名称 | 最新价 | 涨跌幅 | PE | PB | 市值(亿) | 评分 | 核心理由 |")
-    L.append(f"|------|------|------|--------|--------|-----|-----|----------|------|----------|")
+    L.append(f"| 排名 | 代码 | 名称 | 最新价 | 涨跌幅 | 成交额 | 量比 | 换手率 | 评分 | 核心理由 |")
+    L.append(f"|------|------|------|--------|--------|--------|------|--------|------|----------|")
     for i, s in enumerate(top_stocks, 1):
         star = "⭐" if i <= 2 else "★"
-        L.append(f"| {star} {i} | {s['code']} | **{s['name']}** | {num2(s['price'])} | {pct(s['chg_pct'])} | {s['pe']:.1f} | {s['pb']:.2f} | {s['market_cap']:.0f} | **{s['score']}** | {s.get('reasons','')} |")
+        amt_str = f"{s['amount']/1e4:.0f}亿" if s.get('amount',0) > 0 else '-'
+        vr_str = f"{s.get('volume_ratio',0):.1f}" if s.get('volume_ratio',0) > 0 else '-'
+        tr_str = f"{s.get('turnover_rate',0):.1f}%" if s.get('turnover_rate',0) > 0 else '-'
+        L.append(f"| {star} {i} | {s['code']} | **{s['name']}** | {num2(s['price'])} | {pct(s['chg_pct'])} | {amt_str} | {vr_str} | {tr_str} | **{s['score']}** | {s.get('reasons','')} |")
     L.append(f"")
 
     L.append(f"### 📦 精选 ETF")

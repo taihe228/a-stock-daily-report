@@ -739,7 +739,7 @@ def generate_report():
     L.append(f"")
     L.append(f"## 六、📰 财经要闻")
     L.append(f"")
-    has_chip = any('半导体' in s for s, _, _ in sector_avg)
+    has_chip = any('半导体' in s for s, _, _, _ in sector_avg)
     news = []
     if has_chip: news.append("🔥 **半导体产业链活跃**，SEMI上调全球半导体设备销售额预测")
     news.append("📊 **证监会主席吴清召开散户座谈会**，国家队密集增持，A股稳市机制走向常态化")

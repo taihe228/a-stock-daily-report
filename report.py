@@ -65,11 +65,23 @@ def safe_get_json(url, retry=3, timeout=20, referer='https://quote.eastmoney.com
 INDUSTRY_NAME_MAP = {}
 
 def get_industry_sectors():
-    """获取申万一级行业板块涨跌幅（真实全市场数据）
+    """获取行业板块涨跌幅
     数据源1: 东方财富 push2.eastmoney.com (m:90+t:2)
     数据源2: 新浪行业板块接口
-    数据源3: 腾讯主题指数（中证行业指数，备用）
+    数据源3: 腾讯ETF + 行业指数作为板块代理（保证可用）
     """
+    # ETF/指数 → 板块显示名映射
+    SECTOR_DISPLAY_NAME = {
+        '半导体ETF国联安':'半导体', '芯片ETF国泰':'芯片',
+        '通信ETF华夏':'通信', '酒ETF鹏华':'白酒', '医疗ETF华宝':'医疗',
+        '银行ETF华宝':'银行', '证券ETF国泰':'券商', '军工ETF国泰':'军工',
+        '房地产ETF南方':'房地产', '煤炭ETF国泰':'煤炭', '钢铁ETF国泰':'钢铁',
+        '医药ETF易方达':'医药', '中证银行':'银行(指数)', '中证酒':'白酒(指数)',
+        '中证医疗':'医疗(指数)', 'CSWD生科':'生物科技', '基建工程':'基建',
+        '中证白酒':'白酒(指数)', '中证煤炭':'煤炭(指数)', '煤炭等权':'煤炭(指数)',
+        '信息安全':'信息安全', '全指金融':'金融(指数)', '全指信息':'信息(指数)',
+        '全指消费':'消费(指数)',
+    }
     sectors = []
 
     # 方法1: 东方财富行业板块
@@ -96,42 +108,70 @@ def get_industry_sectors():
                 print(f"  ✅ 行业板块(东方财富): {len(sectors)} 个板块")
                 return sectors
 
-    # 方法2: 新浪行业板块
-    sina_url = 'https://vip.stock.finance.sina.com.cn/q/api/jsonp.php/var%20IO_CACHE_RESULT_/Industry_Service.getRankIndustry?type=industry&num=100&_=1'
-    try:
-        h = dict(HEADERS)
-        h['Referer'] = 'https://finance.sina.com.cn/'
-        resp = requests.get(sina_url, headers=h, timeout=15)
-        text = resp.text
-        # 提取JSON部分
-        import re as _re
-        m = _re.search(r'\((.+)\)', text)
-        if m:
-            data = json.loads(m.group(1))
-            items = data.get('result', {}).get('data', [])
-            for it in items:
-                name = it.get('name', '')
-                chg = it.get('chd', 0)  # 涨跌幅
-                if name:
-                    sectors.append({
-                        'name': name, 'code': it.get('code',''),
-                        'chg': float(chg) if chg else 0,
-                        'leader': '', 'leader_chg': 0,
-                        'source': 'sina'
-                    })
-            if len(sectors) >= 20:
-                print(f"  ✅ 行业板块(新浪): {len(sectors)} 个板块")
-                return sectors
-    except Exception as e:
-        print(f"  ⚠️ 新浪板块API失败: {e}")
-
-    # 方法3: 腾讯主题指数（粗粒度备份，仅覆盖部分板块）
-    fallback_codes = [
-        ('sh000005','商业指数'),('sz399986','中证银行'),('sz399987','中证酒'),
-        ('sz399971','中证传媒'),('sz399989','中证医药'),('sz399975','中证有色'),
-        ('sz399976','中证军工'),('sz399993','中证医疗'),('sz399997','中证消费'),
-        ('sz399998','中证金融'),('sz399812','中证基建'),
+    # 方法2: 新浪行业板块（直接拉取行业板块涨跌幅排行）（直接拉取行业板块涨跌幅排行）
+    sina_urls = [
+        'https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/Market_Center.getHQNodeData?node=hangye&num=100&sort=changepercent&asc=0&_s_r_a=page',
+        'https://vip.stock.finance.sina.com.cn/q/api/jsonp.php/var%20IO_CACHE_RESULT_/Industry_Service.getRankIndustry?type=industry&num=100&_=1',
     ]
+    for sina_url in sina_urls:
+        try:
+            h = dict(HEADERS)
+            h['Referer'] = 'https://finance.sina.com.cn/'
+            resp = requests.get(sina_url, headers=h, timeout=15)
+            text = resp.text
+            # 提取JSON部分（处理JSONP）
+            import re as _re
+            m = _re.search(r'\((.+)\)', text)
+            json_text = m.group(1) if m else text
+            if json_text and json_text[0] == '{':
+                data = json.loads(json_text)
+                items = data.get('result', {}).get('data', [])
+                if items and len(items) >= 20:
+                    for it in items:
+                        name = it.get('name', '')
+                        chg = it.get('changepercent', 0) or it.get('chd', 0)
+                        if name and chg is not None:
+                            sectors.append({
+                                'name': name, 'code': it.get('code',''),
+                                'chg': float(chg),
+                                'leader': '', 'leader_chg': 0,
+                                'source': 'sina'
+                            })
+                    if len(sectors) >= 20:
+                        print(f"  ✅ 行业板块(新浪): {len(sectors)} 个板块")
+                        return sectors
+        except Exception as e:
+            print(f"  ⚠️ 新浪板块API {sina_url[:60]}... 失败: {e}")
+
+    # 方法3: 腾讯行业指数 + ETF作为板块代理（最终方案）
+    # 每个板块用其行业ETF或行业指数的实时行情作为板块表现
+    fallback_codes = [
+        # === 科技/半导体 ===
+        ('sh512480','半导体ETF国联安'),('sh512760','芯片ETF国泰'),
+        # === 通信 ===
+        ('sh515050','通信ETF华夏'),
+        # === 消费/酒 ===
+        ('sh512690','酒ETF鹏华'),('sh512170','医疗ETF华宝'),
+        # === 金融/银行 ===
+        ('sh512800','银行ETF华宝'),('sh512880','证券ETF国泰'),
+        # === 军工 ===
+        ('sh512660','军工ETF国泰'),
+        # === 房地产 ===
+        ('sh512200','地产ETF南方'),
+        # === 周期/能源/化工 ===
+        ('sh515220','煤炭ETF'),('sh515210','钢铁ETF'),
+        # === 医药 ===
+        ('sh512010','医药ETF华夏'),
+        # === 中证行业指数（覆盖大类） ===
+        ('sz399986','中证银行'),('sz399987','中证酒'),('sz399989','中证医疗'),
+        ('sz399993','CSWD生科'),('sz399995','基建工程'),('sz399997','中证白酒'),
+        ('sz399998','中证煤炭'),('sz399990','煤炭等权'),('sz399994','信息安全'),
+        # === 主题指数 ===
+        ('sh000992','全指金融'),('sh000993','全指信息'),('sh000994','全指消费'),
+    ]
+    # 去重
+    seen = set()
+    fallback_codes = [(c,n) for c,n in fallback_codes if c not in seen and not seen.add(c)]
     url = f"https://qt.gtimg.cn/q={','.join(c for c,_ in fallback_codes)}"
     try:
         resp = safe_get(url, referer='https://finance.qq.com/')
@@ -144,22 +184,30 @@ def get_industry_sectors():
             p = m.group(1).split('~')
             if len(p) < 33: continue
             code = p[2]
-            name = code_to_name.get(code, p[1])
+            raw_name = code_to_name.get(code, p[1])
+            # 用 SECTOR_DISPLAY_NAME 映射成板块显示名
+            display_name = SECTOR_DISPLAY_NAME.get(raw_name, raw_name)
             chg = p[32] if p[32] else 0
             sectors.append({
-                'name': name, 'code': code, 'chg': float(chg),
+                'name': display_name, 'code': code, 'chg': float(chg),
                 'leader': '', 'leader_chg': 0,
-                'source': 'tencent'
+                'source': 'tencent_etf_index'
             })
-        if sectors:
-            print(f"  ⚠️ 行业板块(腾讯备用): {len(sectors)} 个板块（覆盖不全）")
-            return sectors
+        # 去重（保留每个板块名第一次出现）
+        seen_names = set()
+        unique_sectors = []
+        for s in sectors:
+            if s['name'] not in seen_names:
+                seen_names.add(s['name'])
+                unique_sectors.append(s)
+        if unique_sectors:
+            print(f"  ⚠️ 行业板块(腾讯ETF代理): {len(unique_sectors)} 个板块/指数")
+            return unique_sectors
     except Exception as e:
         print(f"  ⚠️ 腾讯板块备用也失败: {e}")
 
     print(f"  ❌ 行业板块数据全部获取失败")
     return []
-    return None
 
 def pct(v):
     if v is None: return '-'

@@ -15,8 +15,21 @@ if WEEKDAY >= 5:
     print(f"⏭️ 今天是周末（周{WEEKDAY+1}），A股休市，跳过报告生成。")
     sys.exit(0)
 
+# A股收盘时间: 北京时间 15:00。如果在收盘前运行(如凌晨/上午)，报告日期应为前一交易日
+# 判断逻辑: 如果当前时间 < 15:00，则报告日期为昨天（或上周五如果今天是周一）
+current_hour = NOW.hour
+if current_hour < 15:
+    # 收盘前运行，使用前一交易日
+    if WEEKDAY == 0:  # 周一，前一交易日是上周五
+        trade_dt = NOW - timedelta(days=3)
+    else:
+        trade_dt = NOW - timedelta(days=1)
+    TRADE_DATE = trade_dt.strftime("%Y-%m-%d")
+    print(f"⏰ 当前时间 {NOW.strftime('%H:%M')} 早于15:00，报告日期使用前一交易日: {TRADE_DATE}")
+else:
+    TRADE_DATE = NOW.strftime("%Y-%m-%d")
+
 NOW_STR = NOW.strftime("%Y-%m-%d %H:%M:%S")
-TRADE_DATE = NOW.strftime("%Y-%m-%d")
 
 HEADERS = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 OUTPUT_DIR = os.environ.get('OUTPUT_DIR', os.getcwd())

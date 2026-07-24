@@ -2,9 +2,11 @@ name: A股每日投资分析报告
 
 on:
   schedule:
-    # 北京时间每晚 20:00 (UTC+8 = UTC 12:00)
-    # 周一到周五运行
-    - cron: '0 12 * * 1-5'
+    # 目标: 北京时间每晚 20:00 (UTC+8 = UTC 12:00)
+    # GitHub Actions cron 可能有 5-60 分钟延迟，且高峰期延迟更久
+    # 设置两个触发点确保覆盖: UTC 11:30(北京19:30) + UTC 12:30(北京20:30)
+    - cron: '30 11 * * 1-5'
+    - cron: '30 12 * * 1-5'
   
   # 允许手动触发
   workflow_dispatch:
@@ -55,8 +57,8 @@ jobs:
           cp output/A股投资分析报告_*.md reports/ 2>/dev/null || true
           
           # 同步报告到 README.md（手机打开仓库首页直接看到）
-          TODAY=$(date +%Y-%m-%d)
-          REPORT_FILE=$(ls output/A股投资分析报告_${TODAY}.md 2>/dev/null | head -1)
+          # 取最新的报告文件（不依赖日期匹配，避免收盘前运行时日期不匹配）
+          REPORT_FILE=$(ls -t output/A股投资分析报告_*.md 2>/dev/null | head -1)
           if [ -n "$REPORT_FILE" ]; then
             cp "$REPORT_FILE" README.md
           fi

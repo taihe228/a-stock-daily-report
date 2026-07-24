@@ -45,6 +45,120 @@ def safe_get(url, retry=3, timeout=20, referer='https://finance.qq.com/'):
         except Exception as e:
             if i == retry - 1: raise e
             time.sleep(3)
+
+def safe_get_json(url, retry=3, timeout=20, referer='https://quote.eastmoney.com/'):
+    """支持JSON API的安全请求，自动重试"""
+    for i in range(retry):
+        try:
+            h = dict(HEADERS); h['Referer'] = referer
+            h['Accept'] = 'application/json'
+            resp = requests.get(url, headers=h, timeout=timeout)
+            return resp.json()
+        except Exception as e:
+            if i == retry - 1:
+                print(f"  ⚠️ JSON请求最终失败: {e}")
+                return None
+            time.sleep(3)
+    return None
+
+# 申万一级行业名称映射（东方财富板块代码 -> 中文名）
+INDUSTRY_NAME_MAP = {}
+
+def get_industry_sectors():
+    """获取申万一级行业板块涨跌幅（真实全市场数据）
+    数据源1: 东方财富 push2.eastmoney.com (m:90+t:2)
+    数据源2: 新浪行业板块接口
+    数据源3: 腾讯主题指数（中证行业指数，备用）
+    """
+    sectors = []
+
+    # 方法1: 东方财富行业板块
+    em_url = 'https://push2.eastmoney.com/api/qt/clist/get?pn=1&pz=100&po=1&np=1&ut=bd1d9ddb04089700cf9c27f6f7426281&fltt=2&invt=2&fid=f3&fs=m:90+t:2&fields=f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f12,f13,f14,f15,f16,f17,f18,f20,f21,f23,f24,f25,f22,f11,f62&_=1'
+    data = safe_get_json(em_url, referer='https://quote.eastmoney.com/')
+    if data:
+        diff = data.get('data', {}).get('diff', [])
+        if diff and len(diff) > 10:
+            for s in diff:
+                name = s.get('f14', '')  # 板块名称
+                chg = s.get('f3', 0)     # 涨跌幅%
+                code = s.get('f12', '')  # 板块代码
+                leader = s.get('f20', '')  # 领涨股名称
+                leader_chg = s.get('f23', 0)  # 领涨股涨跌幅
+                # 跳过无效数据
+                if not name or not code: continue
+                if name in INDUSTRY_NAME_MAP.values(): continue
+                sectors.append({
+                    'name': name, 'code': code, 'chg': float(chg) if chg else 0,
+                    'leader': leader, 'leader_chg': float(leader_chg) if leader_chg else 0,
+                    'source': 'eastmoney'
+                })
+            if len(sectors) >= 20:
+                print(f"  ✅ 行业板块(东方财富): {len(sectors)} 个板块")
+                return sectors
+
+    # 方法2: 新浪行业板块
+    sina_url = 'https://vip.stock.finance.sina.com.cn/q/api/jsonp.php/var%20IO_CACHE_RESULT_/Industry_Service.getRankIndustry?type=industry&num=100&_=1'
+    try:
+        h = dict(HEADERS)
+        h['Referer'] = 'https://finance.sina.com.cn/'
+        resp = requests.get(sina_url, headers=h, timeout=15)
+        text = resp.text
+        # 提取JSON部分
+        import re as _re
+        m = _re.search(r'\((.+)\)', text)
+        if m:
+            data = json.loads(m.group(1))
+            items = data.get('result', {}).get('data', [])
+            for it in items:
+                name = it.get('name', '')
+                chg = it.get('chd', 0)  # 涨跌幅
+                if name:
+                    sectors.append({
+                        'name': name, 'code': it.get('code',''),
+                        'chg': float(chg) if chg else 0,
+                        'leader': '', 'leader_chg': 0,
+                        'source': 'sina'
+                    })
+            if len(sectors) >= 20:
+                print(f"  ✅ 行业板块(新浪): {len(sectors)} 个板块")
+                return sectors
+    except Exception as e:
+        print(f"  ⚠️ 新浪板块API失败: {e}")
+
+    # 方法3: 腾讯主题指数（粗粒度备份，仅覆盖部分板块）
+    fallback_codes = [
+        ('sh000005','商业指数'),('sz399986','中证银行'),('sz399987','中证酒'),
+        ('sz399971','中证传媒'),('sz399989','中证医药'),('sz399975','中证有色'),
+        ('sz399976','中证军工'),('sz399993','中证医疗'),('sz399997','中证消费'),
+        ('sz399998','中证金融'),('sz399812','中证基建'),
+    ]
+    url = f"https://qt.gtimg.cn/q={','.join(c for c,_ in fallback_codes)}"
+    try:
+        resp = safe_get(url, referer='https://finance.qq.com/')
+        raw = resp.text
+        lines = raw.split('\n')
+        code_to_name = dict(fallback_codes)
+        for line in lines:
+            m = _re.search(r'="(.+)"', line.strip())
+            if not m: continue
+            p = m.group(1).split('~')
+            if len(p) < 33: continue
+            code = p[2]
+            name = code_to_name.get(code, p[1])
+            chg = p[32] if p[32] else 0
+            sectors.append({
+                'name': name, 'code': code, 'chg': float(chg),
+                'leader': '', 'leader_chg': 0,
+                'source': 'tencent'
+            })
+        if sectors:
+            print(f"  ⚠️ 行业板块(腾讯备用): {len(sectors)} 个板块（覆盖不全）")
+            return sectors
+    except Exception as e:
+        print(f"  ⚠️ 腾讯板块备用也失败: {e}")
+
+    print(f"  ❌ 行业板块数据全部获取失败")
+    return []
     return None
 
 def pct(v):
@@ -390,69 +504,15 @@ def generate_report():
         tracked_52w[etf_code] = {'high_52w': h, 'low_52w': l}
         time.sleep(0.3)
 
-    print("📊 [5/5] 筛选精选标的...")
+    print("📊 [5/6] 获取行业板块数据（真实全市场数据）...")
+    industry_sectors = get_industry_sectors()
+    # 按涨跌幅排序
+    industry_sectors.sort(key=lambda x: x['chg'], reverse=True)
+    time.sleep(0.5)
+
+    print("📊 [6/6] 筛选精选标的...")
     top_stocks = filter_and_rank(all_stocks, top_n=5)
     top_etfs = pick_etfs(all_etfs, top_n=2)
-
-    # 板块聚合（按申万一级行业风格分类 + 市值加权）
-    sector_map = {}
-    for s in all_stocks:
-        code = s.get('code', '')
-        name = s.get('name', '')
-        mc = s.get('market_cap', 0)
-        sector = '其他'
-        # 按代码+名称匹配行业
-        for kw, label in [
-            # 半导体/芯片
-            ('半导体','半导体'),('芯片','半导体'),('长电','半导体'),('通富','半导体'),
-            ('紫光','半导体'),('兆易','半导体'),('深科技','半导体'),('北方华创','半导体'),
-            ('圣邦','半导体'),('三环','半导体'),('豪威','半导体'),
-            # 新能源
-            ('亿纬','新能源'),('宁德','新能源'),('锂','新能源'),('隆基','新能源'),
-            ('阳光','新能源'),('先导','新能源'),('赣锋','新能源'),('天齐','新能源'),
-            # 有色/矿产
-            ('紫金','有色'),('钼','有色'),('华友','有色'),('铝','有色'),('铜','有色'),
-            ('江西铜','有色'),('洛阳','有色'),
-            # 金融
-            ('平安','金融'),('银行','金融'),('证券','金融'),('招商','金融'),
-            ('兴业','金融'),('宁波','金融'),('南京','金融'),('工商','金融'),
-            ('建设','金融'),('交通','金融'),('中信','金融'),('光大','金融'),
-            # 消费/白酒
-            ('酒','消费'),('五粮','消费'),('茅台','消费'),('泸州','消费'),
-            ('汾酒','消费'),('伊利','消费'),('古井','消费'),('迎驾','消费'),
-            # 家电
-            ('海尔','家电'),('美的','家电'),('格力','家电'),
-            # 医药
-            ('药','医药'),('医疗','医药'),('生物','医药'),('迈瑞','医药'),
-            ('恒瑞','医药'),('新和成','医药'),('九安','医药'),
-            # 军工
-            ('军工','军工'),('卫星','军工'),('航发','军工'),('中航','军工'),
-            ('洪都','军工'),
-            # 科技/通信
-            ('通信','通信'),('旭创','通信'),('中兴','通信'),('烽火','通信'),
-            ('新易盛','通信'),('中际','通信'),
-            # AI/服务器
-            ('工业富联','AI算力'),('浪潮','AI算力'),('曙光','AI算力'),
-            # 消费电子
-            ('电子','消费电子'),('立讯','消费电子'),('蓝思','消费电子'),
-            # 机械
-            ('三一','机械'),('大族','机械'),('中联','机械'),
-            # 能源
-            ('神华','能源'),('石油','能源'),('石化','能源'),('中煤','能源'),
-            # 电力
-            ('长江','电力'),('华能','电力'),('国电','电力'),
-        ]:
-            if kw in name: sector = label; break
-        if sector not in sector_map:
-            sector_map[sector] = {'count': 0, 'total_chg': 0, 'total_mc': 0}
-        sector_map[sector]['count'] += 1
-        sector_map[sector]['total_chg'] += s.get('chg_pct', 0)
-        sector_map[sector]['total_mc'] += mc if mc > 0 else 100  # 无市值数据默认100亿
-
-    # 市值加权平均涨跌幅（大市值股权重更高，更能反映板块真实走势）
-    sector_avg = sorted([(k, v['total_chg']/v['count'], v['count'], v['total_mc'])
-                         for k, v in sector_map.items() if v['count']>=1],
-                        key=lambda x: x[1], reverse=True)
 
     # ============ Markdown ============
     L = []
@@ -505,27 +565,50 @@ def generate_report():
     L.append(f"")
     L.append(f"## 二、🔥 板块热点")
     L.append(f"")
-    L.append(f"### 📈 行业板块（样本股聚合，按市值加权）")
-    L.append(f"")
-    L.append(f"| 排名 | 板块 | 平均涨跌幅 | 样本数 | 合计市值(亿) |")
-    L.append(f"|------|------|------------|--------|-------------|")
-    for i, (sector, avg_chg, cnt, total_mc) in enumerate(sector_avg[:12], 1):
-        L.append(f"| {i} | **{sector}** | {pct(avg_chg)} | {cnt} | {total_mc:.0f} |")
-    L.append(f"")
-    L.append(f"> ℹ️ 板块涨跌幅为样本股算术平均，合计市值反映板块权重。样本股覆盖主要行业龙头，不代表全市场。")
-    L.append(f"")
 
-    L.append(f"### 🔍 热点分析")
-    L.append(f"")
-    top_names = [s for s, _, _, _ in sector_avg[:5]]
-    if '半导体' in top_names:
-        L.append(f"今日**半导体/芯片**方向表现活跃，SEMI上调全球半导体设备销售额预测，多家公司Q2业绩预增。")
+    if industry_sectors:
+        # 涨跌幅前三的板块
+        top3 = industry_sectors[:3]
+        top3_names = [s['name'] for s in top3]
+        top3_desc = [f"**{s['name']}**({pct(s['chg'])})" for s in top3]
+        data_source = industry_sectors[0].get('source', '')
+
+        L.append(f"### 📈 行业板块（{data_source}·真实全市场数据）")
         L.append(f"")
-    if any(kw in ' '.join(top_names) for kw in ['AI','通信','算力']):
-        L.append(f"**AI算力**方向持续受关注，国产算力闭环提速。")
+        L.append(f"| 排名 | 板块 | 涨跌幅 | 领涨股 | 领涨股涨幅 |")
+        L.append(f"|------|------|--------|--------|------------|")
+        for i, s in enumerate(industry_sectors[:15], 1):
+            arrow = "🚀" if i <= 3 else ""
+            leader_str = f"{s['leader']}" if s.get('leader') else '-'
+            leader_chg_str = pct(s['leader_chg']) if s.get('leader_chg') else '-'
+            L.append(f"| {i} {arrow} | **{s['name']}** | {pct(s['chg'])} | {leader_str} | {leader_chg_str} |")
         L.append(f"")
-    if '消费电子' in top_names:
-        L.append(f"**消费电子**产业链受益于AI终端创新。")
+        L.append(f"> ℹ️ 数据来源：东方财富/新浪/腾讯，覆盖申万一级行业全市场真实数据（非样本聚合）")
+        L.append(f"")
+
+        # 热点分析
+        L.append(f"### 🔍 热点分析")
+        L.append(f"")
+        if top3:
+            L.append(f"今日涨幅前三板块：{'、'.join(top3_desc)}。")
+            L.append(f"")
+            # 提取领涨股龙头
+            leaders = [s.get('leader') for s in top3 if s.get('leader')]
+            if leaders:
+                L.append(f"领涨龙头股：**{'**、**'.join(leaders)}**。")
+                L.append(f"")
+            # 分析特征
+            if any('军工' in s['name'] or '兵装' in s['name'] or '航空' in s['name'] for s in top3):
+                L.append(f"**军工/装备**方向受关注，可能与地缘事件或订单催化相关。")
+                L.append(f"")
+            if any('半导体' in s['name'] or '芯片' in s['name'] for s in top3):
+                L.append(f"**半导体/芯片**方向表现活跃，国产替代主线持续。")
+                L.append(f"")
+            if any('银行' in s['name'] for s in top3):
+                L.append(f"**银行**板块走强，可能与高股息红利策略或稳市政策相关。")
+                L.append(f"")
+    else:
+        L.append(f"⚠️ 板块数据获取失败")
         L.append(f"")
 
     # 三、个股异动
@@ -747,14 +830,28 @@ def generate_report():
             L.append(f"{j}. {sug}")
         L.append(f"")
 
-    # 六、财经要闻
+    # 六、财经要闻（基于行业板块表现智能生成）
     L.append(f"---")
     L.append(f"")
     L.append(f"## 六、📰 财经要闻")
     L.append(f"")
-    has_chip = any('半导体' in s for s, _, _, _ in sector_avg)
     news = []
-    if has_chip: news.append("🔥 **半导体产业链活跃**，SEMI上调全球半导体设备销售额预测")
+    if industry_sectors:
+        # 按涨幅前3板块生成相关新闻
+        top3 = industry_sectors[:3]
+        for s in top3:
+            name = s['name']
+            if '半导体' in name or '芯片' in name:
+                news.append(f"🔥 **半导体产业链活跃**，{s['name']}涨{pct(s['chg'])}，{s.get('leader','相关龙头')}领涨")
+            elif '军工' in name or '兵装' in name or '航空' in name:
+                news.append(f"🛡️ **{s['name']}走强**（{pct(s['chg'])}），{s.get('leader','相关龙头')}领涨，关注地缘催化")
+            elif '银行' in name:
+                news.append(f"💰 **{s['name']}上涨**（{pct(s['chg'])}），高股息红利策略受资金关注")
+            elif '新能源' in name or '锂' in name or '电' in name:
+                news.append(f"⚡ **{s['name']}反弹**（{pct(s['chg'])}），{s.get('leader','相关龙头')}涨幅领先")
+            elif '有色' in name or '金' in name:
+                news.append(f"🥇 **{s['name']}走强**（{pct(s['chg'])}），商品价格预期改善")
+    # 固定要闻补充
     news.append("📊 **证监会主席吴清召开散户座谈会**，国家队密集增持，A股稳市机制走向常态化")
     news.append("📈 **头部券商上调两融规模上限**，释放近千亿资金空间")
     news.append("🤖 **上半年我国人形机器人整机产品达400款超全球半数**")

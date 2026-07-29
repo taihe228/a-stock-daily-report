@@ -526,12 +526,12 @@ def score_stock_shortterm(s):
     elif amt_yi >= 30: score += 12; reasons.append(f'成交额{amt_yi:.0f}亿')
     elif amt_yi >= 10: score += 8
     else: score += 3
-    # 换手率反映资金交投活跃度
-    if 5 <= turnover <= 15: score += 15; reasons.append(f'换手{turnover:.1f}%活跃')
-    elif 3 <= turnover < 5: score += 12
-    elif 15 < turnover <= 25: score += 10
-    elif turnover > 25: score += 5  # 换手过高有风险
-    else: score += 4
+    # 换手率反映资金交投活跃度（短线核心指标，3-10%最佳）
+    if 3 <= turnover <= 10: score += 20; reasons.append(f'换手{turnover:.1f}%最佳活跃')
+    elif 10 < turnover <= 20: score += 15; reasons.append(f'换手{turnover:.1f}%强活跃')
+    elif turnover > 20: score += 8   # 换手过高需谨慎
+    elif 1.5 <= turnover < 3: score += 8  # 刚达标，活跃度一般
+    else: score += 3
 
     # === 2. 量价配合 (25分) ===
     # 量比>1.5 放量，>2 显著放量
@@ -591,7 +591,9 @@ def score_stock_shortterm(s):
     return s
 
 def filter_and_rank(stocks, top_n=5):
-    """短线选股筛选+排名"""
+    """短线选股筛选+排名
+    短线核心标准：换手率≥1.5%（活跃资金）、成交额≥5亿（流动性）
+    """
     qualified = []
     for s in stocks:
         code, name, price = s.get('code', ''), s.get('name', ''), s.get('price', 0)
@@ -601,10 +603,11 @@ def filter_and_rank(stocks, top_n=5):
         if code.startswith('688'): continue  # 排除科创板
         if 'ST' in name: continue            # 排除ST
         if pe is None or pe <= 0: continue   # 排除亏损股
-        # 短线必须有资金参与：成交额>5亿 或 量比>1
+        # 短线必要条件：成交额≥5亿 且 换手率≥1.5%
         amt_yi = s.get('amount', 0) / 1e4
-        vr = s.get('volume_ratio', 0)
-        if amt_yi < 5 and vr < 1.0: continue
+        turnover = s.get('turnover_rate', 0)
+        if amt_yi < 5 or turnover < 1.5:
+            continue
         qualified.append(score_stock_shortterm(s))
     qualified.sort(key=lambda x: x['score'], reverse=True)
     return qualified[:top_n]
@@ -826,7 +829,7 @@ def generate_report():
     L.append(f"## 四、⭐ 每日精选标的")
     L.append(f"")
     L.append(f"> **短线选股模型**（资金面30%+量价配合25%+题材热度20%+技术形态15%+基本面10%）")
-    L.append(f"> 筛选条件：股价<100元、非科创板/ST、PE>0、成交额>5亿或量比>1")
+    L.append(f"> 筛选条件：股价<100元、非科创板/ST、PE>0、成交额≥5亿、**换手率≥1.5%**")
     L.append(f"> ⚠️ 以下内容仅供研究参考，**不构成投资建议**")
     L.append(f"")
     L.append(f"### 🏆 精选个股 TOP5（短线模型）")

@@ -61,6 +61,15 @@ def safe_get_json(url, retry=3, timeout=20, referer='https://quote.eastmoney.com
             time.sleep(3)
     return None
 
+def safe_float(val, default=0.0):
+    """安全转换为float，处理-、空、None等异常值"""
+    if val is None: return default
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return default
+
+
 # 申万行业板块名称简化映射（新浪返回的长名 → 简短显示名）
 SECTOR_SHORT_NAME = {
     '铁路、船舶、航空航天和其他运输设备制造业': '军工装备',
@@ -177,22 +186,22 @@ def _parse_sina_sectors(raw_text, source_tag):
         if not name: continue
         name = short_sector_name(name)
         try:
-            chg = float(parts[5])
+            chg = safe_float(parts[5])
         except (ValueError, IndexError):
             chg = 0
         leader = parts[12].strip() if len(parts) > 12 else ''
         leader_chg = 0
         if len(parts) > 9:
-            try: leader_chg = float(parts[9])
+            try: leader_chg = safe_float(parts[9])
             except (ValueError,): pass
         leader_code = parts[8].strip() if len(parts) > 8 else ''
         amt_yuan = 0
         if len(parts) > 7:
-            try: amt_yuan = float(parts[7])
+            try: amt_yuan = safe_float(parts[7])
             except (ValueError,): pass
         stock_cnt = 0
         if len(parts) > 2:
-            try: stock_cnt = int(parts[2])
+            try: stock_cnt = int(safe_float(parts[2]))
             except (ValueError,): pass
         # 过滤无效板块（成交额为0或股票数<2的通常是非活跃板块）
         if amt_yuan < 1e6 or stock_cnt < 2:
@@ -247,8 +256,8 @@ def get_industry_sectors():
                 leader_chg = s.get('f23', 0)
                 if not name or not code: continue
                 sectors.append({
-                    'name': name, 'code': code, 'chg': float(chg) if chg else 0,
-                    'leader': leader, 'leader_chg': float(leader_chg) if leader_chg else 0,
+                    'name': name, 'code': code, 'chg': safe_float(chg),
+                    'leader': leader, 'leader_chg': safe_float(leader_chg),
                     'leader_code': '', 'amount': 0, 'stock_count': 0,
                     'source': 'eastmoney'
                 })
@@ -297,7 +306,7 @@ def get_industry_sectors():
             display_name = SECTOR_DISPLAY_NAME.get(raw_name, raw_name)
             chg = p[32] if p[32] else 0
             sectors.append({
-                'name': display_name, 'code': code, 'chg': float(chg),
+                'name': display_name, 'code': code, 'chg': safe_float(chg),
                 'leader': '', 'leader_chg': 0, 'leader_code': '',
                 'amount': 0, 'stock_count': 0,
                 'source': 'tencent_etf_index'
@@ -396,11 +405,11 @@ def get_index_data():
         if not m: continue
         p = m.group(1).split('~')
         if len(p) < 40: continue
-        close = float(p[3]) if p[3] else 0
-        prev = float(p[4]) if p[4] else close
+        close = safe_float(p[3]) if p[3] else 0
+        prev = safe_float(p[4]) if p[4] else close
         chg = close - prev
         chg_pct = (close/prev - 1)*100 if prev else 0
-        a = float(p[37]) if len(p)>37 and p[37] else 0  # 万元
+        a = safe_float(p[37]) if len(p)>37 and p[37] else 0  # 万元
         idx_code = INDEX_CODES[len(results)] if len(results) < len(INDEX_CODES) else ''
         if idx_code in main_indices:
             total_amt += a
@@ -423,21 +432,21 @@ def get_stock_data(codes):
                 if len(p) < 50: continue
                 results.append({
                     'code': p[2], 'name': p[1],
-                    'price': float(p[3]) if p[3] else 0,
-                    'prev_close': float(p[4]) if p[4] else 0,
-                    'open': float(p[5]) if p[5] else 0,
-                    'volume': float(p[6]) if p[6] else 0,
-                    'chg_pct': float(p[32]) if p[32] else 0,
-                    'high': float(p[33]) if p[33] else 0,
-                    'low': float(p[34]) if p[34] else 0,
-                    'amount': float(p[37]) if p[37] else 0,  # 万元
-                    'turnover_rate': float(p[38]) if p[38] else 0,  # 换手率%
-                    'pe': float(p[39]) if p[39] and float(p[39]) > 0 else None,
-                    'high_52w': float(p[41]) if p[41] else 0,
-                    'low_52w': float(p[42]) if p[42] else 0,
-                    'market_cap': float(p[45]) if p[45] else 0,  # 亿
-                    'pb': float(p[46]) if p[46] and float(p[46]) > 0 else None,
-                    'volume_ratio': float(p[49]) if p[49] else 0,  # 量比
+                    'price': safe_float(p[3]) if p[3] else 0,
+                    'prev_close': safe_float(p[4]) if p[4] else 0,
+                    'open': safe_float(p[5]) if p[5] else 0,
+                    'volume': safe_float(p[6]) if p[6] else 0,
+                    'chg_pct': safe_float(p[32]) if p[32] else 0,
+                    'high': safe_float(p[33]) if p[33] else 0,
+                    'low': safe_float(p[34]) if p[34] else 0,
+                    'amount': safe_float(p[37]) if p[37] else 0,  # 万元
+                    'turnover_rate': safe_float(p[38]) if p[38] else 0,  # 换手率%
+                    'pe': safe_float(p[39]) if p[39] and safe_float(p[39]) > 0 else None,
+                    'high_52w': safe_float(p[41]) if p[41] else 0,
+                    'low_52w': safe_float(p[42]) if p[42] else 0,
+                    'market_cap': safe_float(p[45]) if p[45] else 0,  # 亿
+                    'pb': safe_float(p[46]) if p[46] and safe_float(p[46]) > 0 else None,
+                    'volume_ratio': safe_float(p[49]) if p[49] else 0,  # 量比
                 })
             time.sleep(0.3)
         except Exception as e:
@@ -464,8 +473,8 @@ def get_etf_52week(code):
                 stock_data = data['data'].get(f'{prefix}{clean_code}', {})
                 days = stock_data.get('qfqday') or stock_data.get('day')
                 if days and len(days) > 0:
-                    highs = [float(d[3]) for d in days]
-                    lows = [float(d[4]) for d in days]
+                    highs = [safe_float(d[3]) for d in days]
+                    lows = [safe_float(d[4]) for d in days]
                     print(f"  ✅ {code} 52周数据(腾讯): high={max(highs):.3f}, low={min(lows):.3f}")
                     return max(highs), min(lows)
         except Exception as e:
@@ -477,8 +486,8 @@ def get_etf_52week(code):
         resp = requests.get(sina_url, headers=HEADERS, timeout=15)
         data = resp.json()
         if data and len(data) > 0:
-            highs = [float(x['high']) for x in data]
-            lows = [float(x['low']) for x in data]
+            highs = [safe_float(x['high']) for x in data]
+            lows = [safe_float(x['low']) for x in data]
             print(f"  ✅ {code} 52周数据(新浪): high={max(highs):.3f}, low={min(lows):.3f}")
             return max(highs), min(lows)
     except Exception as e:
@@ -491,8 +500,8 @@ def get_etf_52week(code):
         data = resp.json()
         klines = data.get('data', {}).get('klines', [])
         if klines and len(klines) > 0:
-            highs = [float(k.split(',')[2]) for k in klines]
-            lows = [float(k.split(',')[3]) for k in klines]
+            highs = [safe_float(k.split(',')[2]) for k in klines]
+            lows = [safe_float(k.split(',')[3]) for k in klines]
             print(f"  ✅ {code} 52周数据(东方财富): high={max(highs):.3f}, low={min(lows):.3f}")
             return max(highs), min(lows)
     except Exception as e:

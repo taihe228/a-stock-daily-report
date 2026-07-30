@@ -148,22 +148,31 @@ def get_all_stocks_parallel(candidates, batch_size=80, max_workers=6):
 
 
 def get_kline_batch(codes, days=30):
-    """批量获取个股日K线"""
+    """批量获取个股日K线（逐只查询更稳定）"""
     if not codes: return {}
-    code_str = ','.join(codes[:5])
-    url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code_str},day,,,{days},qfq"
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=10)
-        data = resp.json()
-    except: return {}
     results = {}
-    for code in codes:
-        d = data.get('data', {}).get(code, {})
-        klines = d.get('qfqday', d.get('day', []))
-        if not klines: continue
-        results[code] = [{'date': k[0], 'open': safe_float(k[1]), 'close': safe_float(k[2]),
-                          'high': safe_float(k[3]), 'low': safe_float(k[4]), 'volume': safe_float(k[5])}
-                         for k in klines[-days:]]
+    for code in codes[:5]:  # 最多5只
+        url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={code},day,,,{days},qfq"
+        try:
+            resp = requests.get(url, headers=HEADERS, timeout=10)
+            data = resp.json()
+            d = data.get('data', {})
+            # 兼容不同返回格式
+            if isinstance(d, dict):
+                stock_data = d.get(code, {})
+                if isinstance(stock_data, dict):
+                    klines = stock_data.get('qfqday', stock_data.get('day', []))
+                else:
+                    klines = []
+            elif isinstance(d, list):
+                klines = d
+            else:
+                klines = []
+            if not klines: continue
+            results[code] = [{'date': k[0], 'open': safe_float(k[1]), 'close': safe_float(k[2]),
+                              'high': safe_float(k[3]), 'low': safe_float(k[4]), 'volume': safe_float(k[5])}
+                             for k in klines[-days:]]
+        except: continue
     return results
 
 
@@ -511,6 +520,9 @@ STOCK_CANDIDATES = [
 ETF_CANDIDATES = [
     'sh510050','sh510300','sh510500','sh588000','sh159919','sh512480','sh159995',
     'sh512760','sh515050','sh512660','sh516510','sh512880','sh513180','sh159766',
+    # 新增成长性ETF
+    'sh512690','sh512010','sh512170','sh512200','sh515220','sh515210',
+    'sh512980','sh516970','sh588200','sh159845','sh562500','sh516160',
 ]
 
 TRACKED_ETFS = ['sh512690', 'sz159781']
@@ -776,7 +788,10 @@ def score_stock_shortterm(s):
 
 def filter_and_rank(stocks, top_n=5):
     """短线选股筛选+排名
-    短线核心标准：换手率≥1.5%（活跃资金）、成交额≥5亿（流动性）
+    适合小资金博大收益原则：
+    - 安全边际：PE 5-80（排除亏损和高估值泡沫）、PB<15、股价3-80元
+    - 成长性：成交额≥5亿、换手率≥1.5%、量比≥0.8
+    - 剔除北交所(bj)/科创板(688)/ST/新三板
     """
     qualified = []
     for s in stocks:
@@ -784,10 +799,13 @@ def filter_and_rank(stocks, top_n=5):
         pe, pb = s.get('pe'), s.get('pb')
         # 基本过滤条件
         if price <= 0 or price >= 100: continue
-        if code.startswith('688'): continue  # 排除科创板
-        if 'ST' in name: continue            # 排除ST
-        if pe is None or pe <= 0: continue   # 排除亏损股
-        # 短线必要条件：成交额≥5亿 且 换手率≥1.5%
+        if code.startswith('688') or code.startswith('bj'): continue  # 排除科创板/北交所
+        if 'ST' in name or '*ST' in name: continue  # 排除ST
+        # 安全边际：PE 5-80、PB<15、股价≥3元（小资金友好）
+        if pe is None or pe <= 0 or pe > 80: continue
+        if pb is not None and pb > 15: continue
+        if price < 3: continue  # 低价股风险高
+        # 成长性：成交额≥5亿 且 换手率≥1.5%
         amt_yi = s.get('amount', 0) / 1e4
         turnover = s.get('turnover_rate', 0)
         if amt_yi < 5 or turnover < 1.5:
@@ -797,27 +815,93 @@ def filter_and_rank(stocks, top_n=5):
     return qualified[:top_n]
 
 def pick_etfs(etf_data, top_n=3):
+    """ETF选股：适合小资金博大收益
+    筛选标准：
+    - 安全边际：剔除单边下跌（MA5>MA10=上升趋势）、52周位置20-70%
+    - 成长性：近期5日涨幅>-3%、有成长主题
+    - 流动性：成交额>5亿
+    - 价格适配小资金：0.3-5元（一手300-500元起）
+    """
     scored = []
-    hot_kw = ['半导体','芯片','科创','AI','人工智能','通信','科技','恒生科技','云计算']
+    growth_kw = ['半导体','芯片','科创','AI','人工智能','通信','科技','云计算','新能源','光伏','军工','医药','生物','消费','机器人']
     for e in etf_data:
         score, reasons = 0, []
         name = e.get('name', '')
-        amt_val = e.get('amount', 0)
+        amt_val = e.get('amount', 0)  # 万元
         chg = e.get('chg_pct', 0)
-        if amt_val > 5e4: score += 15; reasons.append('流动性极好')
-        elif amt_val > 1e4: score += 10; reasons.append('流动性良好')
-        else: score += 3
-        if 1 <= chg <= 8: score += 12; reasons.append('趋势健康')
-        elif chg > 8: score += 8; reasons.append('短期强势')
-        elif -3 <= chg < 1: score += 8; reasons.append('蓄势待发')
-        else: score += 3
-        for kw in hot_kw:
-            if kw in name: score += 8; reasons.append(f'热门主题({kw})'); break
-        else: score += 3
-        if 0.5 <= e.get('price', 0) <= 5: score += 5
+        price = e.get('price', 0)
+        high_52w = e.get('high_52w', 0)
+        low_52w = e.get('low_52w', 0)
+        trend_up = e.get('trend_up', False)
+        near_5d_chg = e.get('near_5d_chg', 0)
+        
+        # 1. 流动性筛选（必需）— 成交额>5亿
+        amt_yi = amt_val / 1e4
+        if amt_yi < 5: continue
+        if amt_yi > 20: score += 15; reasons.append('流动性充裕')
+        elif amt_yi > 10: score += 12; reasons.append('流动性良好')
+        else: score += 8
+        
+        # 2. 趋势安全边际（核心！）— 剔除单边下跌
+        # MA5>MA10=上升趋势，否则为下跌趋势
+        # 注意：K线数据可能因API限流获取不到，需用当日涨跌作为备用判断
+        has_kline = e.get('near_5d_chg', 0) != 0 or e.get('trend_up', False)
+        if trend_up:
+            score += 20; reasons.append('MA5>MA10上升趋势')
+        elif has_kline and near_5d_chg > -3:
+            score += 10; reasons.append('趋势走平')
+        elif has_kline and near_5d_chg > -5:
+            score += 3; reasons.append(f'近5日{near_5d_chg:.1f}%调整')
+        elif has_kline:
+            continue  # 近5日跌超5%直接淘汰（单边下跌，不适合中短期）
+        else:
+            # K线数据不可用时，用当日涨跌判断
+            if chg > -2:
+                score += 8; reasons.append('当日趋势尚可')
+            elif chg > -5:
+                score += 3
+            else:
+                continue  # 当日跌超5%且无K线数据=可能单边下跌，淘汰
+        
+        # 3. 52周位置（辅助判断）
+        if high_52w > 0 and low_52w > 0 and price > 0:
+            w52_pos = (price - low_52w) / (high_52w - low_52w) * 100
+        else:
+            w52_pos = 50
+        if 20 <= w52_pos <= 70:
+            score += 15; reasons.append(f'52周{w52_pos:.0f}%安全')
+        elif 70 < w52_pos <= 85:
+            score += 8
+        elif w52_pos > 85:
+            score += 3
+        elif 10 <= w52_pos < 20:
+            score += 8; reasons.append(f'52周{w52_pos:.0f}%低位')
+        else:
+            score += 2
+        
+        # 4. 当日涨跌趋势
+        if 0 < chg <= 5: score += 8; reasons.append(f'涨{chg:.1f}%')
+        elif chg > 5: score += 6
+        elif -1 <= chg <= 0: score += 6
+        elif -3 <= chg < -1: score += 3
+        elif chg < -5: score += 1
+        else: score += 2
+        
+        # 5. 成长性主题
+        for kw in growth_kw:
+            if kw in name: score += 10; reasons.append(f'成长({kw})'); break
+        else: score += 2
+        
+        # 6. 小资金适配
+        if 0.3 <= price <= 3: score += 10; reasons.append(f'价{price:.2f}小资金友好')
+        elif 3 < price <= 5: score += 7
+        elif 5 < price <= 10: score += 4
+        else: score += 2
+        
         e['etf_score'] = score
-        e['etf_reasons'] = '、'.join(reasons)
+        e['etf_reasons'] = '·'.join(reasons[:4])
         scored.append(e)
+    
     scored.sort(key=lambda x: x['etf_score'], reverse=True)
     return scored[:top_n]
 
@@ -859,7 +943,31 @@ def generate_report():
 
     print("📊 [4/5] 获取ETF数据...")
     all_etfs = get_stock_data(ETF_CANDIDATES)
-    time.sleep(0.5)
+    # 为所有ETF候选获取52周高低点+近期K线趋势（用于趋势判断）
+    print("  📈 获取ETF 52周数据+趋势...")
+    for etf in all_etfs:
+        h, l = get_etf_52week(etf['code'])
+        etf['high_52w'] = h if h > 0 else etf.get('high_52w', 0)
+        etf['low_52w'] = l if l > 0 else etf.get('low_52w', 0)
+    # 获取近期K线判断趋势方向
+    etf_codes = [e['code'] for e in all_etfs]
+    for i in range(0, len(etf_codes), 5):
+        batch = get_kline_batch(etf_codes[i:i+5], days=30)
+        for code, klines in batch.items():
+            if len(klines) >= 10:
+                closes = [k['close'] for k in klines]
+                ma5 = sum(closes[-5:]) / 5
+                ma10 = sum(closes[-10:]) / 10
+                ma20 = sum(closes[-20:]) / 20 if len(closes) >= 20 else ma10
+                for e in all_etfs:
+                    if e['code'] == code:
+                        e['trend_up'] = closes[-1] > ma5 and ma5 > ma10  # 是否上升趋势
+                        e['ma5'] = ma5
+                        e['ma10'] = ma10
+                        e['ma20'] = ma20
+                        e['near_5d_chg'] = (closes[-1] - closes[-5]) / closes[-5] * 100 if len(closes) >= 5 else 0
+                        break
+    time.sleep(0.3)
 
     print("📊 [5/6] 获取跟踪ETF的52周数据...")
     tracked_52w = {}
@@ -1011,6 +1119,17 @@ def generate_report():
         sector_amt = s.get('amount', 0)
         leader_chg = s.get('leader_chg', 0)
         stock_cnt = s.get('stock_count', 0)
+        leader_name = s.get('leader', '')
+        leader_code = s.get('leader_code', '')
+        # 剔除北交所(bj开头/920开头)和新三板标的，确保龙头是主板/创业板真正龙头
+        if leader_code:
+            if leader_code.startswith('bj') or leader_code.startswith('bj920'):
+                leader_name = '-'
+                leader_chg = 0
+            # 剔除8/4开头的三板代码
+            elif len(leader_code) >= 4 and leader_code[2] in ('8', '4') and not leader_code.startswith(('sh', 'sz')):
+                leader_name = '-'
+                leader_chg = 0
         # 综合评分（简化版预判）
         momentum = chg  # 涨幅
         liquidity = min(sector_amt / 5e10, 10) if sector_amt > 0 else 0  # 成交额得分
@@ -1018,7 +1137,7 @@ def generate_report():
         diversity = min(stock_cnt / 10, 5) if stock_cnt > 0 else 0  # 规模得分
         total = momentum * 0.4 + liquidity * 0.3 + leader * 0.2 + diversity * 0.1
         scored_sectors.append({'name': s['name'], 'chg': chg, 'score': total,
-                               'leader': s.get('leader',''), 'leader_chg': leader_chg})
+                               'leader': leader_name, 'leader_chg': leader_chg})
     scored_sectors.sort(key=lambda x: x['score'], reverse=True)
     # 取前5名
     hot_sectors = scored_sectors[:5]
@@ -1030,9 +1149,10 @@ def generate_report():
         if s['leader_chg'] > 5: logic_parts.append("龙头领涨")
         if s['chg'] > 2 and s['leader_chg'] > 3: logic_parts.append("板块共振")
         logic = "·".join(logic_parts) if logic_parts else "关注"
-        L.append(f"| **{s['name']}** | {pct(s['chg'])} | {s['score']:.1f} | {s.get('leader','-')} | {logic} |")
+        leader_display = s.get('leader', '-') if s.get('leader') else '-'
+        L.append(f"| **{s['name']}** | {pct(s['chg'])} | {s['score']:.1f} | {leader_display} | {logic} |")
     L.append(f"")
-    L.append(f"> 🔮 预判逻辑基于当日涨幅、成交额、龙头股强度、板块规模综合评估，反映短期动量最强的板块方向。")
+    L.append(f"> 🔮 预判逻辑基于当日涨幅、成交额、龙头强度、板块规模综合评估，已剔除北交所/三板标的")
     L.append(f"")
 
     # 三、个股异动
@@ -1069,7 +1189,8 @@ def generate_report():
     L.append(f"")
     L.append(f"> **专业短线选股模型**（资金强度20%+量价共振20%+趋势动量20%+板块加持15%+盘口活跃15%+基本面10%）")
     L.append(f"> 全市场筛选：从{len(all_stocks)}只A股中综合评分选出，非样本池选股")
-    L.append(f"> 筛选条件：股价<100元、非科创板/ST、PE>0、成交额≥5亿、换手率≥1.5%")
+    L.append(f"> 小资金博收益：股价3-80元、PE 5-80、PB<15、成交额≥5亿、换手率≥1.5%")
+    L.append(f"> 安全边际+成长性：兼顾估值合理与趋势向上，剔除北交所/科创板/ST")
     L.append(f"> ⚠️ 以下内容仅供研究参考，**不构成投资建议**")
     L.append(f"")
     L.append(f"### 🏆 精选个股 TOP5（短线模型）")

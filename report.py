@@ -531,6 +531,28 @@ TRACKED_ETF_DESC = {
     'sh512690': '跟踪中证酒指数，覆盖白酒、啤酒、葡萄酒龙头',
     'sz159781': '跟踪科创创业50指数，覆盖科创板和创业板龙头科技公司',
 }
+
+# ============================================================
+# 用户持仓跟踪配置（每日深度分析+操作策略）
+# 注意：腾讯实时行情API需要带sh/sz前缀，K线API也用同一前缀
+# ============================================================
+USER_HOLDINGS = ['sh512690', 'sz159781', 'sz300457']
+HOLDING_NAMES = {
+    'sh512690': '酒ETF鹏华(512690)',
+    'sz159781': '科创创业ETF易方达(159781)',
+    'sz300457': '赢合科技(300457)',
+}
+HOLDING_DESC = {
+    'sh512690': '跟踪中证酒指数，白酒/啤酒/葡萄酒龙头，受益于消费复苏预期',
+    'sz159781': '跟踪科创创业50指数，半导体/新能源/生物医药科技龙头',
+    'sz300457': '锂电池设备龙头，宁德时代/比亚迪供应链，受益新能源车景气回升',
+}
+# 每只持仓的初始成本价（用户输入的参考成本，可由用户调整）
+HOLDING_COST = {
+    'sh512690': 0.519,    # 持仓成本（收益率-15.03%）
+    'sz159781': 1.3854,   # 持仓成本（收益率-17.06%）
+    'sz300457': 21.37,    # 持仓成本（收益率-4.59%）
+}
 TRACKED_ETF_COMPONENTS = {
     'sh512690': ['sh600519','sz000858','sz000568','sh600809','sz002304',
                  'sh600600','sh600132','sz000596','sz000799','sh600559'],
@@ -1377,6 +1399,183 @@ def generate_report():
         L.append(f"**详细分析**:")
         for j, sug in enumerate(suggestions, 1):
             L.append(f"{j}. {sug}")
+        L.append(f"")
+
+    # 五-附加、用户持仓深度分析（含300457赢合科技）
+    L.append(f"---")
+    L.append(f"")
+    L.append(f"## 五-附加、💼 用户持仓深度跟踪")
+    L.append(f"")
+    L.append(f"> 每日对持仓的3只标的（2只ETF+1只个股）进行深度分析，结合成本价、走势、估值给出操作策略")
+    L.append(f"")
+
+    holdings_data = get_stock_data(USER_HOLDINGS)
+    # 同时获取持仓K线（统一处理），USER_HOLDINGS已带前缀
+    holding_klines = {}
+    for h in USER_HOLDINGS:
+        try:
+            kd = get_kline_batch([h], days=60)
+            if kd and h in kd:
+                tech = calc_tech_indicators(h, kd[h])
+                # 用无前缀的纯数字code作key（与hd['code']一致）
+                plain_code = h.replace('sh','').replace('sz','')
+                if tech: holding_klines[plain_code] = tech
+        except: pass
+
+    for hd in holdings_data:
+        raw_code = hd['code']  # 腾讯API返回的是无前缀的纯数字
+        # 兼容查询（带前缀key优先，回退到无前缀key）
+        name = HOLDING_NAMES.get(f'sh{raw_code}', HOLDING_NAMES.get(f'sz{raw_code}', HOLDING_NAMES.get(raw_code, hd['name'])))
+        desc = HOLDING_DESC.get(f'sh{raw_code}', HOLDING_DESC.get(f'sz{raw_code}', HOLDING_DESC.get(raw_code, '')))
+        cost = HOLDING_COST.get(f'sh{raw_code}', HOLDING_COST.get(f'sz{raw_code}', HOLDING_COST.get(raw_code, 0)))
+        code = raw_code  # 后续判断用无前缀code
+        price = hd['price']
+        chg_pct = hd['chg_pct']
+        amount = hd['amount']
+        prev_close = hd['prev_close']
+        high = hd['high']
+        low = hd['low']
+        open_price = hd['open']
+        pe = hd.get('pe') or 0
+        mcap = hd.get('market_cap') or 0
+        profit_pct = (price - cost) / cost * 100 if cost > 0 else 0
+        tech = holding_klines.get(code, {})
+
+        # 技术形态判断
+        ma5 = tech.get('ma5', 0)
+        ma10 = tech.get('ma10', 0)
+        ma20 = tech.get('ma20', 0)
+        chg_5d = tech.get('chg_5d', 0)
+        streak = tech.get('streak', 0)
+        macd_sig = tech.get('macd_signal', 0)
+        bull_align = tech.get('bull_align', 0)
+
+        trend_status = ''
+        if ma5 > 0 and ma10 > 0:
+            if ma5 > ma10 > ma20 and price > ma5:
+                trend_status = '✅ 多头排列，趋势向上'
+            elif ma5 > ma10 and price > ma5:
+                trend_status = '🟢 短期反弹，趋势转好'
+            elif price < ma5 < ma10 < ma20:
+                trend_status = '🔴 空头排列，趋势向下'
+            elif ma5 < ma10:
+                trend_status = '🟡 均线粘合，等待方向选择'
+            else:
+                trend_status = '⚪ 震荡格局'
+
+        # 盈亏状态
+        profit_status = '🟢 盈利' if profit_pct > 0 else ('⚪ 持平' if abs(profit_pct) < 1 else '🔴 亏损')
+
+        emoji = '🍷' if '512690' in code else ('🚀' if '159781' in code else '⚡')
+
+        L.append(f"### {emoji} {name}")
+        L.append(f"")
+        L.append(f"> {desc}")
+        L.append(f"")
+
+        # 盈亏概览
+        L.append(f"#### 📉 持仓盈亏")
+        L.append(f"")
+        L.append(f"| 项目 | 数值 |")
+        L.append(f"|------|------|")
+        L.append(f"| 持仓成本 | {num2(cost)} |")
+        L.append(f"| 当前价格 | **{num2(price)}** |")
+        profit_emoji = '🟢' if profit_pct > 0 else '🔴'
+        L.append(f"| 盈亏比例 | {profit_emoji} **{profit_pct:+.2f}%** |")
+        L.append(f"| 盈亏状态 | {profit_status} |")
+        L.append(f"")
+
+        # 今日行情
+        L.append(f"#### 📊 今日行情")
+        L.append(f"")
+        L.append(f"| 指标 | 数据 |")
+        L.append(f"|------|------|")
+        emoji_p = "🔴" if chg_pct > 0 else ("🟢" if chg_pct < 0 else "⚪")
+        L.append(f"| 最新价 | {emoji_p} **{num2(price)}** |")
+        L.append(f"| 涨跌幅 | {pct(chg_pct)} |")
+        L.append(f"| 今开/最高/最低 | {num2(open_price)} / {num2(high)} / {num2(low)} |")
+        L.append(f"| 成交额 | {amt(amount)} |")
+        if pe > 0:
+            L.append(f"| 市盈率(TTM) | {pe:.2f} |")
+        if mcap > 0:
+            L.append(f"| 流通市值 | {mcap:.2f}亿 |")
+        L.append(f"")
+
+        # 技术分析
+        L.append(f"#### 📈 技术面分析")
+        L.append(f"")
+        L.append(f"| 指标 | 数值 | 信号 |")
+        L.append(f"|------|------|------|")
+        L.append(f"| MA5 | {num2(ma5)} | {'上穿MA10↑' if ma5>ma10 else '下穿MA10↓'} |")
+        L.append(f"| MA10 | {num2(ma10)} | - |")
+        L.append(f"| MA20 | {num2(ma20)} | {'多头支撑' if price>ma20 else '空头压制'} |")
+        L.append(f"| 5日累计涨跌 | {pct(chg_5d)} | {'强势' if chg_5d>3 else ('偏弱' if chg_5d<-3 else '震荡')} |")
+        L.append(f"| MACD信号 | {'DIF>0 看多' if macd_sig else 'DIF<0 看空'} | {'金叉区域' if macd_sig else '死叉区域'} |")
+        L.append(f"| 连阳天数 | {streak}天 | {'强势' if streak>=3 else ('一般' if streak>=1 else '弱势')} |")
+        L.append(f"| 趋势研判 | {trend_status} | - |")
+        L.append(f"")
+
+        # 未来走势预测与操作策略
+        L.append(f"#### 🔮 未来走势预测 & 操作策略")
+        L.append(f"")
+
+        # 根据盈亏+技术形态综合判断
+        forecast = []
+        action = []
+
+        if profit_pct < -10 and bull_align >= 5:
+            forecast.append(f"📍 **深度亏损但技术转好**：当前亏损{abs(profit_pct):.1f}%，但MA5上穿MA10，KDJ/MACD出现底背离迹象")
+            forecast.append(f"📈 **未来1-2周预测**：预计进入震荡修复期，反弹目标位 {num2(price*1.05)} - {num2(price*1.08)}")
+            action.append(f"✅ **建议**：**持有待反弹**，不轻易割肉；可在 {num2(cost*0.95)} 附近小幅加仓摊薄成本")
+            action.append(f"🎯 **止损位**：跌破 {num2(cost*0.90)} 或近期低点需警惕")
+        elif profit_pct < -10 and bull_align < 3:
+            forecast.append(f"📍 **深度亏损+趋势走弱**：当前亏损{abs(profit_pct):.1f}%，均线空头排列")
+            forecast.append(f"📉 **未来1-2周预测**：下行压力较大，预计在 {num2(price*0.95)} - {num2(price*1.02)} 区间筑底")
+            action.append(f"⚠️ **建议**：**观望为主**，等待放量站上MA20再考虑补仓")
+            action.append(f"🎯 **止损位**：有效跌破 {num2(price*0.92)} 应止损减仓")
+        elif -10 <= profit_pct < 0 and chg_pct >= 0:
+            forecast.append(f"📍 **小幅亏损但今日反弹**：亏损{abs(profit_pct):.1f}%，当日收阳")
+            forecast.append(f"📈 **未来1-2周预测**：技术修复中，有望挑战 {num2(cost)} 成本位")
+            action.append(f"✅ **建议**：**持有**，待反弹至成本价附近时考虑减仓降低仓位")
+            action.append(f"🎯 **目标位**：{num2(cost)}（回本）→ {num2(cost*1.05)}（盈利5%）")
+        elif -10 <= profit_pct < 0 and chg_pct < 0:
+            forecast.append(f"📍 **小幅亏损+今日下跌**：亏损{abs(profit_pct):.1f}%，短期承压")
+            forecast.append(f"📉 **未来1-2周预测**：弱势震荡，关注下方支撑")
+            action.append(f"⚠️ **建议**：**谨慎持有**，不轻易补仓，等待企稳信号")
+            action.append(f"🎯 **止损位**：跌破近期低点需减仓")
+        elif profit_pct >= 0:
+            forecast.append(f"📍 **当前盈利**：盈利 {profit_pct:.1f}%，心态较为从容")
+            forecast.append(f"📈 **未来1-2周预测**：跟随大盘节奏，可适当锁定部分利润")
+            action.append(f"✅ **建议**：**持有为主**，可逢高减仓1/3兑现利润，剩余仓位跟踪趋势")
+        else:
+            forecast.append(f"📍 **盈亏平衡附近**：持仓成本与现价接近")
+            forecast.append(f"📊 **未来1-2周预测**：方向不明，需结合大盘和板块情绪判断")
+            action.append(f"⚖️ **建议**：**观望**，根据大盘走势决定加减仓")
+
+        # 个性化建议（按标的属性）
+        if '512690' in code:
+            forecast.append(f"🍶 **板块逻辑**：白酒板块短期受双节消费预期提振，但中长期受经济复苏节奏制约")
+            action.append(f"💡 **板块跟踪**：关注贵州茅台/五粮液批价、库存数据、双节动销情况")
+        elif '159781' in code:
+            forecast.append(f"🔬 **板块逻辑**：科创创业50集中半导体+新能源+生物医药，受美联储加息周期影响较大")
+            action.append(f"💡 **板块跟踪**：关注半导体周期回升、新能源车销量、医药创新审批进度")
+        elif '300457' in code:
+            forecast.append(f"🔋 **板块逻辑**：锂电池设备景气度与新能源车销量正相关，PE 22倍处于历史中位偏低")
+            action.append(f"💡 **板块跟踪**：关注宁德时代/比亚迪扩产节奏、固态电池技术突破、锂电设备订单")
+
+        for f in forecast:
+            L.append(f"{f}")
+        L.append(f"")
+        for a in action:
+            L.append(f"- {a}")
+        L.append(f"")
+
+        # 风险提示
+        L.append(f"⚠️ **风险提示**：")
+        if profit_pct < -15:
+            L.append(f"- 当前深度套牢，需严格控制总仓位，避免单一标的风险过度集中")
+        L.append(f"- 以上分析基于历史数据和技术指标，不构成投资建议，市场存在不确定性")
+        L.append(f"- 操作策略应结合个人风险承受能力和整体市场环境灵活调整")
         L.append(f"")
 
     # 六、财经要闻（基于行业板块表现智能生成）

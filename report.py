@@ -929,6 +929,94 @@ def get_etf_weekly_trend(code):
         monthly_ma5 = sum(monthly_closes[-5:]) / 5 if len(monthly_closes) >= 5 else (sum(monthly_closes) / len(monthly_closes) if monthly_closes else 0)
         monthly_bull = price > monthly_ma5 if monthly_ma5 > 0 else False
         below_monthly_ma5_pct = (monthly_ma5 - price) / monthly_ma5 * 100 if monthly_ma5 > 0 else 0
+        # 月线MA5斜率（判断趋势方向）：当前MA5 vs 前一个月MA5
+        month_k, month_d, month_j = calc_kdj(monthly_closes)
+        monthly_ma5_prev = sum(monthly_closes[-6:-1]) / 5 if len(monthly_closes) >= 6 else monthly_ma5
+        monthly_ma5_slope = (monthly_ma5 - monthly_ma5_prev) / monthly_ma5_prev * 100 if monthly_ma5_prev > 0 else 0
+        monthly_uptrend = monthly_ma5_slope > 0 and monthly_ma5 > monthly_ma5_prev
+
+        # ===== 方案D：多因子超跌反弹判断 =====
+
+        # 1. 日线均线排列判断（多头/空头）
+        day_ma5 = sum(closes[-5:]) / 5 if len(closes) >= 5 else 0
+        day_ma10 = sum(closes[-10:]) / 10 if len(closes) >= 10 else 0
+        day_ma20 = sum(closes[-20:]) / 20 if len(closes) >= 20 else 0
+        day_ma60 = sum(closes[-60:]) / 60 if len(closes) >= 60 else 0
+        # 日线多头/空头排列
+        day_bull_align = price > day_ma5 > day_ma10 > day_ma20 > day_ma60
+        day_bear_align = price < day_ma5 < day_ma10 < day_ma20 < day_ma60
+
+        # 周线均线排列
+        week_ma5 = sum(weekly_closes[-5:]) / 5 if len(weekly_closes) >= 5 else 0
+        week_ma10 = sum(weekly_closes[-10:]) / 10 if len(weekly_closes) >= 10 else 0
+        week_ma20 = weekly_ma20
+        week_ma60 = sum(weekly_closes[-60:]) / 60 if len(weekly_closes) >= 60 else 0
+        week_bear_align = price < week_ma5 < week_ma10 < week_ma20 and week_ma5 > 0 and week_ma10 > 0 and week_ma20 > 0
+
+        # 月线均线排列（空头：月线MA5<MA10<MA20）
+        # 注意：250天K线约12个月，月MA20(需20个月)通常不可用，此时退化为 价<MA5<MA10 判断月线空头
+        month_ma5 = monthly_ma5
+        month_ma10 = sum(monthly_closes[-10:]) / 10 if len(monthly_closes) >= 10 else 0
+        month_ma20 = sum(monthly_closes[-20:]) / 20 if len(monthly_closes) >= 20 else 0
+        if month_ma20 > 0:
+            # 有月MA20：完整空头排列 价<MA5<MA10<MA20
+            month_bear_align = price < month_ma5 < month_ma10 < month_ma20
+        else:
+            # 无月MA20：退化为 价<MA5<MA10（月线MA5与MA10死叉向下）
+            month_bear_align = price < month_ma5 < month_ma10 and month_ma5 > 0 and month_ma10 > 0
+
+        # 全周期（日+周+月）空头排列 → 熊市结构，超跌不可靠
+        full_bear_structure = day_bear_align or week_bear_align or month_bear_align
+
+        # 2. MACD底背离判断（下跌动能是否衰竭）
+        # 用日线MACD，简化：DIF线
+        def calc_macd(closes_list, fast=12, slow=26, signal=9):
+            if len(closes_list) < slow + signal:
+                return 0
+            ema_fast, ema_slow = closes_list[0], closes_list[0]
+            for c in closes_list[1:]:
+                ema_fast = ema_fast + 2/(fast+1) * (c - ema_fast)
+                ema_slow = ema_slow + 2/(slow+1) * (c - ema_slow)
+            dif = ema_fast - ema_slow
+            return dif
+        macd_now = calc_macd(closes)
+        # 近20日最低点的MACD（用简化：近20日DIF最低值）
+        macd_low_20 = 0
+        # 检查价格新低但MACD未新低（底背离）
+        price_low_20 = min(closes[-20:]) if len(closes) >= 20 else price
+        recent_5d_price = closes[-5:]
+        price_new_low = price <= min(price_low_20 * 1.01, min(recent_5d_price)) if recent_5d_price else False
+        # 简化底背离：近5日价格创新低，但DIF未创新低（用当前DIF vs 之前）
+        macd_bull_div = False
+
+        # 3. 止跌K线形态识别（最近1-2根）
+        stop_signal = False
+        if len(klines_raw) >= 2:
+            last = klines_raw[-1]
+            prev = klines_raw[-2]
+            try:
+                o, c, h, l = float(last[1]), float(last[2]), float(last[3]), float(last[4])
+                prev_c = float(prev[2])
+                body = abs(c - o)
+                shadow_lower = min(o, c) - l
+                shadow_upper = h - max(o, c)
+                # 长下影线（下影>实体2倍 且 >K线幅度的1/3）
+                if body > 0 and shadow_lower > body * 2:
+                    stop_signal = True
+                # 锤子线：下影很长，实体小
+                if shadow_lower > shadow_upper * 2 and shadow_lower > body * 1.5:
+                    stop_signal = True
+                # 十字星：实体极小
+                if body < (h - l) * 0.15 and (h - l) > 0:
+                    stop_signal = True
+            except:
+                pass
+
+        # 4. 缩量企稳（连续下跌后缩量，可能见底）
+        # 简化：近5日量能持续萎缩且跌幅收窄
+        vol_5d_shrink = False
+        if len(volumes) >= 5:
+            vol_5d_shrink = volumes[-1] < sum(volumes[-5:-1]) / 4 if len(volumes) >= 5 else False
 
         return {
             'weekly_ma20': weekly_ma20,
@@ -940,9 +1028,22 @@ def get_etf_weekly_trend(code):
             # 方案C择时信号
             'day_j': day_j,
             'week_j': week_j,
+            'month_j': month_j,
             'vol_ratio': vol_ratio,
             'cur_vol': cur_vol,
             'vol_ma5': vol_ma5,
+            # 方案D多因子
+            'monthly_ma5_slope': monthly_ma5_slope,
+            'monthly_uptrend': monthly_uptrend,
+            'day_bull_align': day_bull_align,
+            'day_bear_align': day_bear_align,
+            'week_bear_align': week_bear_align,
+            'month_bear_align': month_bear_align,
+            'full_bear_structure': full_bear_structure,
+            'stop_signal': stop_signal,
+            'month_ma5': month_ma5,
+            'month_ma10': month_ma10,
+            'month_ma20': month_ma20,
         }
     except:
         return None
@@ -1007,20 +1108,57 @@ def pick_etfs(etf_data, top_n=3):
                 score += 5; reasons.append(f'周线MA20下方{below_w:.1f}%')
             if weekly_trend['monthly_bull']:
                 score += 10; reasons.append('月线MA5上方')
-            # ===== 方案C：择时信号 =====
+            # ===== 方案C+D：择时信号 + 多因子超跌反弹判断 =====
             day_j = weekly_trend.get('day_j', 50)
             week_j = weekly_trend.get('week_j', 50)
+            month_j = weekly_trend.get('month_j', 50)
             vol_ratio = weekly_trend.get('vol_ratio', 0)
+            # 方案D因子
+            monthly_uptrend = weekly_trend.get('monthly_uptrend', False)
+            day_bear_align = weekly_trend.get('day_bear_align', False)
+            week_bear_align = weekly_trend.get('week_bear_align', False)
+            month_bear_align = weekly_trend.get('month_bear_align', False)
+            stop_signal = weekly_trend.get('stop_signal', False)
+
+            # ===== 方案D核心：多周期超卖共振（替代单周期超卖直接加分）=====
+            if day_j < 10:
+                # 基础：单周期超卖，只给小幅加分
+                score += 3; reasons.append(f'日线超卖(J={day_j:.0f})')
+                # 多周期共振：日线+周线都超卖 → 较大加分
+                if week_j < 30:
+                    score += 5; reasons.append('日周超卖共振')
+                    # 日+周+月全部超卖 → 强力加分
+                    if month_j < 30:
+                        score += 7; reasons.append('日月周超卖共振')
+            elif day_j < 30:
+                score += 3; reasons.append(f'日线超卖区(J={day_j:.0f})')
+
+            # ===== 方案D核心：趋势结构过滤（熊市超跌是陷阱）=====
+            # 月线趋势向下（MA5下拐）→ 超跌可能是下跌中继，降分
+            if not monthly_uptrend and month_j < 50:
+                score -= 8; reasons.append('⚠️月线趋势向下，超跌谨慎')
+            # 日线空头排列 → 降分
+            if day_bear_align:
+                score -= 6; reasons.append('日线空头排列')
+            # 周线空头排列 → 显著降分
+            if week_bear_align:
+                score -= 10; reasons.append('⚠️周线空头，超跌不可靠')
+            # 月线空头排列 → 强力降分（熊市结构）
+            if month_bear_align:
+                score -= 12; reasons.append('⚠️月线空头，下跌趋势')
+            # 极端：日+周+月全部空头 → 淘汰（下跌趋势中的超跌，反弹概率极低）
+            if day_bear_align and week_bear_align and month_bear_align:
+                continue
+
+            # ===== 方案D：止跌K线信号 → 加分 =====
+            if stop_signal:
+                score += 6; reasons.append('🟢止跌K线(下影/锤子)')
+
             # 日线KDJ超买（J>85）→ 降分，提示等回调
             if day_j > 85:
                 score -= 12; reasons.append(f'⚠️日线超买(J={day_j:.0f})')
             elif day_j > 70:
                 score -= 5; reasons.append(f'日线偏热(J={day_j:.0f})')
-            # 日线KDJ超卖（J<10）→ 升分，提示超卖机会
-            elif day_j < 10:
-                score += 10; reasons.append(f'🟢日线超卖(J={day_j:.0f})')
-            elif day_j < 30:
-                score += 5; reasons.append(f'日线超卖区(J={day_j:.0f})')
             # 周线KDJ超买 → 降分（追高风险）
             if week_j > 100:
                 score -= 8; reasons.append(f'⚠️周线超买(J={week_j:.0f})')

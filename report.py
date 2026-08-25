@@ -878,7 +878,7 @@ def get_etf_weekly_trend(code):
         # ===== 方案C：日线KDJ =====
         # 计算日线KDJ（K、D、J），使用标准KDJ算法
         def calc_kdj(closes_list):
-            """计算KDJ，返回 (K, D, J)"""
+            """计算KDJ，返回 (K, D, J) 最终值"""
             if len(closes_list) < 9:
                 return (50, 50, 50)
             k, d = 50.0, 50.0
@@ -893,6 +893,24 @@ def get_etf_weekly_trend(code):
                 d = 2/3 * d + 1/3 * k
             j = 3 * k - 2 * d
             return (k, d, j)
+
+        def calc_kdj_series(closes_list):
+            """计算KDJ，返回完整J值序列（用于拐点检测）"""
+            if len(closes_list) < 9:
+                return [50.0]
+            k, d = 50.0, 50.0
+            j_list = []
+            for i in range(len(closes_list)):
+                low9 = min(closes_list[max(0, i-8):i+1])
+                high9 = max(closes_list[max(0, i-8):i+1])
+                if high9 == low9:
+                    rsv = 50
+                else:
+                    rsv = (closes_list[i] - low9) / (high9 - low9) * 100
+                k = 2/3 * k + 1/3 * rsv
+                d = 2/3 * d + 1/3 * k
+                j_list.append(3 * k - 2 * d)
+            return j_list
 
         day_k, day_d, day_j = calc_kdj(closes)
 
@@ -934,6 +952,15 @@ def get_etf_weekly_trend(code):
         monthly_ma5_prev = sum(monthly_closes[-6:-1]) / 5 if len(monthly_closes) >= 6 else monthly_ma5
         monthly_ma5_slope = (monthly_ma5 - monthly_ma5_prev) / monthly_ma5_prev * 100 if monthly_ma5_prev > 0 else 0
         monthly_uptrend = monthly_ma5_slope > 0 and monthly_ma5 > monthly_ma5_prev
+
+        # ===== 方案E：月线J值拐点检测（解决月MA5斜率滞后3个月的问题）=====
+        month_j_series = calc_kdj_series(monthly_closes)
+        month_j_prev = month_j_series[-2] if len(month_j_series) >= 2 else 50
+        month_j_prev2 = month_j_series[-3] if len(month_j_series) >= 3 else 50
+        # 月线底部拐点：前月J<20(超卖区)，当月J回升(>前月J) → 比月MA5斜率快2个月
+        month_j_turning = month_j_prev < 20 and month_j > month_j_prev
+        # 月线拐头确认：连续2个月J回升
+        month_j_rising_2m = len(month_j_series) >= 3 and month_j > month_j_prev > month_j_prev2
 
         # ===== 方案D：多因子超跌反弹判断 =====
 
@@ -980,14 +1007,11 @@ def get_etf_weekly_trend(code):
             dif = ema_fast - ema_slow
             return dif
         macd_now = calc_macd(closes)
-        # 近20日最低点的MACD（用简化：近20日DIF最低值）
-        macd_low_20 = 0
-        # 检查价格新低但MACD未新低（底背离）
+        # 方案E：实现MACD底背离检测（价格创新低但DIF未创新低 → 下跌动能衰竭）
+        macd_20d_ago = calc_macd(closes[:-20]) if len(closes) >= 46 else 0
         price_low_20 = min(closes[-20:]) if len(closes) >= 20 else price
-        recent_5d_price = closes[-5:]
-        price_new_low = price <= min(price_low_20 * 1.01, min(recent_5d_price)) if recent_5d_price else False
-        # 简化底背离：近5日价格创新低，但DIF未创新低（用当前DIF vs 之前）
-        macd_bull_div = False
+        # 底背离条件：当前价格接近近20日低点(±2%)，但当前DIF高于20日前的DIF
+        macd_bull_div = (price <= price_low_20 * 1.02) and (macd_now > macd_20d_ago * 0.9) and (macd_20d_ago != 0)
 
         # 3. 止跌K线形态识别（最近1-2根）
         stop_signal = False
@@ -1044,6 +1068,10 @@ def get_etf_weekly_trend(code):
             'month_ma5': month_ma5,
             'month_ma10': month_ma10,
             'month_ma20': month_ma20,
+            # 方案E：月线拐点感知
+            'month_j_turning': month_j_turning,
+            'month_j_rising_2m': month_j_rising_2m,
+            'macd_bull_div': macd_bull_div,
         }
     except:
         return None
@@ -1119,6 +1147,10 @@ def pick_etfs(etf_data, top_n=3):
             week_bear_align = weekly_trend.get('week_bear_align', False)
             month_bear_align = weekly_trend.get('month_bear_align', False)
             stop_signal = weekly_trend.get('stop_signal', False)
+            # 方案E：月线拐点感知
+            month_j_turning = weekly_trend.get('month_j_turning', False)
+            month_j_rising_2m = weekly_trend.get('month_j_rising_2m', False)
+            macd_bull_div = weekly_trend.get('macd_bull_div', False)
 
             # ===== 方案D核心：多周期超卖共振（替代单周期超卖直接加分）=====
             if day_j < 10:
@@ -1133,10 +1165,14 @@ def pick_etfs(etf_data, top_n=3):
             elif day_j < 30:
                 score += 3; reasons.append(f'日线超卖区(J={day_j:.0f})')
 
-            # ===== 方案D核心：趋势结构过滤（熊市超跌是陷阱）=====
+            # ===== 方案D+E核心：趋势结构过滤（熊市超跌是陷阱）=====
             # 月线趋势向下（MA5下拐）→ 超跌可能是下跌中继，降分
+            # 方案E改进：如果月J有拐点信号，不降分反加分（月MA5滞后3个月，J值拐头快2个月）
             if not monthly_uptrend and month_j < 50:
-                score -= 8; reasons.append('⚠️月线趋势向下，超跌谨慎')
+                if month_j_turning or month_j_rising_2m:
+                    score += 3; reasons.append('🔄月线J值拐头，底部信号')
+                else:
+                    score -= 8; reasons.append('⚠️月线趋势向下，超跌谨慎')
             # 日线空头排列 → 降分
             if day_bear_align:
                 score -= 6; reasons.append('日线空头排列')
@@ -1144,15 +1180,27 @@ def pick_etfs(etf_data, top_n=3):
             if week_bear_align:
                 score -= 10; reasons.append('⚠️周线空头，超跌不可靠')
             # 月线空头排列 → 强力降分（熊市结构）
+            # 方案E改进：月J拐头时减轻降分（从-12降到-4，给底部回升机会）
             if month_bear_align:
-                score -= 12; reasons.append('⚠️月线空头，下跌趋势')
+                if month_j_turning:
+                    score -= 4; reasons.append('月线空头但J值拐头')
+                else:
+                    score -= 12; reasons.append('⚠️月线空头，下跌趋势')
             # 极端：日+周+月全部空头 → 淘汰（下跌趋势中的超跌，反弹概率极低）
+            # 方案E改进：如果月J拐头+止跌K线，保留观察而非直接淘汰
             if day_bear_align and week_bear_align and month_bear_align:
-                continue
+                if month_j_turning and stop_signal:
+                    score -= 15; reasons.append('全空头+月线拐头，高风险观察')
+                else:
+                    continue  # 淘汰
 
             # ===== 方案D：止跌K线信号 → 加分 =====
             if stop_signal:
                 score += 6; reasons.append('🟢止跌K线(下影/锤子)')
+
+            # ===== 方案E：MACD底背离 → 加分（下跌动能衰竭信号）=====
+            if macd_bull_div:
+                score += 8; reasons.append('🔄MACD底背离')
 
             # 日线KDJ超买（J>85）→ 降分，提示等回调
             if day_j > 85:
@@ -1240,7 +1288,7 @@ def pick_etfs(etf_data, top_n=3):
         e['etf_sector'] = _classify_etf_sector(code, name)
 
         e['etf_score'] = score
-        e['etf_reasons'] = '·'.join(reasons[:5])
+        e['etf_reasons'] = '·'.join(reasons[:6])
         scored.append(e)
 
     scored.sort(key=lambda x: x['etf_score'], reverse=True)

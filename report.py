@@ -816,6 +816,33 @@ def score_stock_shortterm(s):
     elif pe and pe > 0: score += 2
     else: score += 1
 
+    # ===== 7. 多因子择时（方案D+E，±20分）=====
+    # 复用周/月线多因子信号：MACD底背离、止跌K线、月J拐点、周/月线趋势等
+    mt = s.get('multi_trend')
+    if mt:
+        day_j = mt.get('day_j', 50)
+        week_j = mt.get('week_j', 50)
+        month_j = mt.get('month_j', 50)
+        # 周/月线趋势加分（多头结构）
+        if mt.get('weekly_bull'): score += 4; reasons.append('周线MA20上方')
+        if mt.get('monthly_bull'): score += 3; reasons.append('月线MA5上方')
+        # 月线拐点感知（方案E：月J拐头快于月MA5）
+        if mt.get('month_j_turning'): score += 4; reasons.append('🔄月J拐头')
+        if mt.get('month_j_rising_2m'): score += 3; reasons.append('月J连续回升')
+        # MACD底背离（方案E：下跌动能衰竭）
+        if mt.get('macd_bull_div'): score += 5; reasons.append('🔄MACD底背离')
+        # 止跌K线（方案D：长下影/锤子/十字星）
+        if mt.get('stop_signal'): score += 3; reasons.append('🟢止跌K线')
+        # 日线KDJ超卖（短线买点）
+        if day_j < 10: score += 3; reasons.append('日线超卖')
+        elif day_j < 30: score += 2
+        # 日线KDJ超买 → 降分（追高风险）
+        if day_j > 85: score -= 4; reasons.append('⚠️日线超买')
+        # 周线空头排列 → 降分
+        if mt.get('week_bear_align'): score -= 3; reasons.append('周线空头')
+        # 月线空头排列 → 降分（熊市结构）
+        if mt.get('month_bear_align'): score -= 4; reasons.append('月线空头')
+
     s['score'] = score
     s['reasons'] = reasons
     return s
@@ -844,16 +871,48 @@ def filter_and_rank(stocks, top_n=5):
         turnover = s.get('turnover_rate', 0)
         if amt_yi < 5 or turnover < 1.5:
             continue
+
+        # ===== 方案F：惰性获取周/月线多因子信号（仅对通过基础过滤的候选）=====
+        mt = s.get('multi_trend')
+        if mt is None:
+            # 补全sh/sz前缀（腾讯K线API需要）
+            if code.startswith(('sh', 'sz')):
+                full_code = code
+            elif code[0] in ('6', '5', '9'):
+                full_code = f'sh{code}'
+            else:
+                full_code = f'sz{code}'
+            mt = get_multi_trend(full_code)
+            if mt:
+                s['multi_trend'] = mt
+
+        # 方案A：周/月线趋势硬过滤（仅当有multi_trend数据，API失败时跳过多因子过滤保持兼容）
+        if mt:
+            # 跌破周线MA20超7% → 中线破位，淘汰
+            if mt['below_weekly_ma20_pct'] > 7:
+                continue
+            # 跌破月线MA5超5% → 长线趋势破坏，淘汰
+            if mt['below_monthly_ma5_pct'] > 5:
+                continue
+            # 日+周+月全部空头 → 熊市超跌陷阱，淘汰（除非月J拐头+止跌K线）
+            day_bear = mt.get('day_bear_align', False)
+            week_bear = mt.get('week_bear_align', False)
+            month_bear = mt.get('month_bear_align', False)
+            if day_bear and week_bear and month_bear:
+                if not (mt.get('month_j_turning', False) and mt.get('stop_signal', False)):
+                    continue
+
         qualified.append(score_stock_shortterm(s))
     qualified.sort(key=lambda x: x['score'], reverse=True)
     return qualified[:top_n]
 
-def get_etf_weekly_trend(code):
-    """获取ETF周线/月线趋势 + 择时信号（方案A+C核心）
+def get_multi_trend(code):
+    """获取任意标的（ETF或个股）的周线/月线趋势 + 多因子择时信号（方案A+C+D+E核心）
     拉取250天日K → 转换为周线/月线
     返回:
     - 趋势: weekly_ma20, monthly_ma5, weekly_bull, monthly_bull, below_*
     - 择时(方案C): day_j_kdj(日线J值), week_j_kdj(周线J值), volume_ratio(量价), vol_ma5, vol_ma10
+    - 多因子(方案D+E): 月线空头排列, 止跌K线, 月J拐点, MACD底背离
     """
     try:
         # 使用 kline 端点（fqkline 端点被WAF拦截）
@@ -1075,6 +1134,10 @@ def get_etf_weekly_trend(code):
         }
     except:
         return None
+
+
+# 兼容别名：get_etf_weekly_trend（旧名称，ETF场景继续使用）
+get_etf_weekly_trend = get_multi_trend
 
 
 def pick_etfs(etf_data, top_n=3):

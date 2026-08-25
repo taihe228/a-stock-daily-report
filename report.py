@@ -849,9 +849,11 @@ def filter_and_rank(stocks, top_n=5):
     return qualified[:top_n]
 
 def get_etf_weekly_trend(code):
-    """获取ETF周线/月线趋势判断（方案A核心）
-    拉取250天日K → 转换为周线 → 计算周MA20和月MA5
-    返回: {'weekly_ma20': x, 'monthly_ma5': y, 'weekly_bull': bool, 'monthly_bull': bool, 'below_weekly_ma20_pct': z}
+    """获取ETF周线/月线趋势 + 择时信号（方案A+C核心）
+    拉取250天日K → 转换为周线/月线
+    返回:
+    - 趋势: weekly_ma20, monthly_ma5, weekly_bull, monthly_bull, below_*
+    - 择时(方案C): day_j_kdj(日线J值), week_j_kdj(周线J值), volume_ratio(量价), vol_ma5, vol_ma10
     """
     try:
         # 使用 kline 端点（fqkline 端点被WAF拦截）
@@ -870,14 +872,46 @@ def get_etf_weekly_trend(code):
         if not klines_raw or len(klines_raw) < 60:
             return None
         closes = [safe_float(k[2]) for k in klines_raw[-250:]]
+        volumes = [safe_float(k[5]) if len(k) > 5 else 0 for k in klines_raw[-250:]]
         price = closes[-1]
+
+        # ===== 方案C：日线KDJ =====
+        # 计算日线KDJ（K、D、J），使用标准KDJ算法
+        def calc_kdj(closes_list):
+            """计算KDJ，返回 (K, D, J)"""
+            if len(closes_list) < 9:
+                return (50, 50, 50)
+            k, d = 50.0, 50.0
+            for i in range(len(closes_list)):
+                low9 = min(closes_list[max(0, i-8):i+1])
+                high9 = max(closes_list[max(0, i-8):i+1])
+                if high9 == low9:
+                    rsv = 50
+                else:
+                    rsv = (closes_list[i] - low9) / (high9 - low9) * 100
+                k = 2/3 * k + 1/3 * rsv
+                d = 2/3 * d + 1/3 * k
+            j = 3 * k - 2 * d
+            return (k, d, j)
+
+        day_k, day_d, day_j = calc_kdj(closes)
+
+        # 日量能（当前量 vs MA5/MA10）
+        vol_ma5 = sum(volumes[-5:]) / 5 if len(volumes) >= 5 else 0
+        vol_ma10 = sum(volumes[-10:]) / 10 if len(volumes) >= 10 else 0
+        cur_vol = volumes[-1] if volumes else 0
+        # 量价关系：正数=放量，负数=缩量
+        vol_ratio = (cur_vol / vol_ma5 - 1) * 100 if vol_ma5 > 0 else 0
 
         # 日K → 周K（每5个交易日聚合为1周）
         weekly_closes = []
+        weekly_volumes = []
         for i in range(0, len(closes), 5):
             week = closes[i:i+5]
             if week:
-                weekly_closes.append(week[-1])  # 取每周收盘
+                weekly_closes.append(week[-1])
+                weekly_volumes.append(sum(volumes[i:i+5]))
+        week_k, week_d, week_j = calc_kdj(weekly_closes)
 
         # 周MA20 = 20周均线
         weekly_ma20 = sum(weekly_closes[-20:]) / 20 if len(weekly_closes) >= 20 else (sum(weekly_closes) / len(weekly_closes) if weekly_closes else 0)
@@ -903,6 +937,12 @@ def get_etf_weekly_trend(code):
             'monthly_bull': monthly_bull,
             'below_weekly_ma20_pct': below_weekly_ma20_pct,
             'below_monthly_ma5_pct': below_monthly_ma5_pct,
+            # 方案C择时信号
+            'day_j': day_j,
+            'week_j': week_j,
+            'vol_ratio': vol_ratio,
+            'cur_vol': cur_vol,
+            'vol_ma5': vol_ma5,
         }
     except:
         return None
@@ -967,6 +1007,32 @@ def pick_etfs(etf_data, top_n=3):
                 score += 5; reasons.append(f'周线MA20下方{below_w:.1f}%')
             if weekly_trend['monthly_bull']:
                 score += 10; reasons.append('月线MA5上方')
+            # ===== 方案C：择时信号 =====
+            day_j = weekly_trend.get('day_j', 50)
+            week_j = weekly_trend.get('week_j', 50)
+            vol_ratio = weekly_trend.get('vol_ratio', 0)
+            # 日线KDJ超买（J>85）→ 降分，提示等回调
+            if day_j > 85:
+                score -= 12; reasons.append(f'⚠️日线超买(J={day_j:.0f})')
+            elif day_j > 70:
+                score -= 5; reasons.append(f'日线偏热(J={day_j:.0f})')
+            # 日线KDJ超卖（J<10）→ 升分，提示超卖机会
+            elif day_j < 10:
+                score += 10; reasons.append(f'🟢日线超卖(J={day_j:.0f})')
+            elif day_j < 30:
+                score += 5; reasons.append(f'日线超卖区(J={day_j:.0f})')
+            # 周线KDJ超买 → 降分（追高风险）
+            if week_j > 100:
+                score -= 8; reasons.append(f'⚠️周线超买(J={week_j:.0f})')
+            # 量价背离：缩量上涨 → 降分
+            if vol_ratio < -15 and chg > 0:
+                score -= 8; reasons.append(f'⚠️缩量上涨({vol_ratio:.0f}%)')
+            # 放量下跌 → 降分
+            elif vol_ratio > 15 and chg < -2:
+                score -= 6; reasons.append(f'放量下跌({vol_ratio:.0f}%)')
+            # 缩量回调（健康回踩）→ 升分
+            elif vol_ratio < -15 and chg < 0:
+                score += 5; reasons.append(f'缩量回调({vol_ratio:.0f}%)')
         # 周线数据不可用时不淘汰，但不加分（保持兼容性）
 
         # 1. 流动性筛选（必需）— 成交额>5亿
@@ -1424,13 +1490,32 @@ def generate_report():
         L.append(f"| {star} {i} | {s['code']} | **{s['name']}** | {num2(s['price'])} | {pct(s['chg_pct'])} | {amt_str} | {vr_str} | {tr_str} | **{s['score']}** | {reasons_raw} |")
     L.append(f"")
 
-    L.append(f"### 📦 精选 ETF（行业分散+周线趋势过滤）")
+    L.append(f"### 📦 精选 ETF（行业分散+周线趋势过滤+KDJ择时）")
     L.append(f"")
-    L.append(f"| 排名 | 代码 | 名称 | 行业 | 最新价 | 涨跌幅 | 成交额 | 推荐理由 |")
-    L.append(f"|------|------|------|------|--------|--------|--------|----------|")
+    L.append(f"| 排名 | 代码 | 名称 | 行业 | 最新价 | 涨跌幅 | 成交额 | 推荐理由 | 买入建议 |")
+    L.append(f"|------|------|------|------|--------|--------|--------|----------|----------|")
     for i, e in enumerate(top_etfs, 1):
         sector = e.get('etf_sector', '其他')
-        L.append(f"| {'⭐' if i==1 else '★'} {i} | {e['code']} | **{e['name']}** | {sector} | {num2(e['price'])} | {pct(e['chg_pct'])} | {amt(e['amount'])} | {e.get('etf_reasons','')} |")
+        # 方案C：根据KDJ/量能生成买入建议
+        wt = e.get('weekly_trend')
+        buy_advice = '观望'
+        if wt:
+            day_j = wt.get('day_j', 50)
+            week_j = wt.get('week_j', 50)
+            vol_ratio = wt.get('vol_ratio', 0)
+            if day_j > 85:
+                buy_advice = '⚠️超买，等回踩'
+            elif day_j < 10:
+                buy_advice = '🟢超卖，可分批'
+            elif day_j < 30:
+                buy_advice = '🟢回踩，关注企稳'
+            elif day_j > 70:
+                buy_advice = '偏热，回踩再买'
+            else:
+                buy_advice = '中性，可小仓试探'
+            if week_j > 100:
+                buy_advice += '(周线偏热)'
+        L.append(f"| {'⭐' if i==1 else '★'} {i} | {e['code']} | **{e['name']}** | {sector} | {num2(e['price'])} | {pct(e['chg_pct'])} | {amt(e['amount'])} | {e.get('etf_reasons','')} | {buy_advice} |")
     L.append(f"")
 
     # 五、ETF 专项跟踪
@@ -1766,6 +1851,12 @@ def generate_report():
                 w_bull = '✅周线MA20上方' if weekly_trend_holding['weekly_bull'] else f'❌周线MA20下方{weekly_trend_holding["below_weekly_ma20_pct"]:.1f}%'
                 m_bull = '✅月线MA5上方' if weekly_trend_holding['monthly_bull'] else f'❌月线MA5下方{weekly_trend_holding["below_monthly_ma5_pct"]:.1f}%'
                 forecast.append(f"📊 **中长期趋势**：{w_bull}，{m_bull}")
+                # 方案C：KDJ择时提示
+                dj = weekly_trend_holding.get('day_j', 50)
+                if dj > 85:
+                    forecast.append(f"🔍 **短线信号**：日线KDJ超买(J={dj:.0f})，短期或有回调，反弹中可考虑减仓")
+                elif dj < 10:
+                    forecast.append(f"🔍 **短线信号**：日线KDJ超卖(J={dj:.0f})，存在超跌反弹机会，可关注企稳")
             action.append(f"💡 **板块跟踪**：关注贵州茅台/五粮液批价、库存数据、双节动销情况")
         elif '159781' in code:
             forecast.append(f"🔬 **板块逻辑**：科创创业50集中半导体+新能源+生物医药，受美联储加息周期影响较大")
@@ -1775,6 +1866,12 @@ def generate_report():
                 forecast.append(f"📊 **中长期趋势**：{w_bull}，{m_bull}")
                 if not weekly_trend_holding['weekly_bull'] and weekly_trend_holding['below_weekly_ma20_pct'] > 3:
                     action.append(f"⚠️ **趋势警示**：周线已破位，反弹至MA20附近考虑减仓，不宜追加")
+                # 方案C：KDJ择时提示
+                dj = weekly_trend_holding.get('day_j', 50)
+                if dj > 85:
+                    forecast.append(f"🔍 **短线信号**：日线KDJ超买(J={dj:.0f})，短期或有回调，反弹中可考虑减仓")
+                elif dj < 10:
+                    forecast.append(f"🔍 **短线信号**：日线KDJ超卖(J={dj:.0f})，存在超跌反弹机会，可关注企稳")
             action.append(f"💡 **板块跟踪**：关注半导体周期回升、新能源车销量、医药创新审批进度")
         elif '300457' in code:
             forecast.append(f"🔋 **板块逻辑**：锂电池设备景气度与新能源车销量正相关，PE 22倍处于历史中位偏低")

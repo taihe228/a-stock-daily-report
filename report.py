@@ -517,13 +517,25 @@ STOCK_CANDIDATES = [
     'sh600900','sh601006','sh600009','sh601111',
 ]
 
-ETF_CANDIDATES = [
-    'sh510050','sh510300','sh510500','sh588000','sh159919','sh512480','sh159995',
-    'sh512760','sh515050','sh512660','sh516510','sh512880','sh513180','sh159766',
-    # 新增成长性ETF
-    'sh512690','sh512010','sh512170','sh512200','sh515220','sh515210',
-    'sh512980','sh516970','sh588200','sh159845','sh562500','sh516160',
-]
+# ETF候选池（按行业分类，每类最多推荐1只，避免同质化风险）
+ETF_CANDIDATES_BY_SECTOR = {
+    '科技/半导体': ['sh588000','sh588200','sh512480','sh512760','sh159995','sh516160'],
+    '科创/创业': ['sz159781','sh159919','sh515050'],
+    '宽基/指数': ['sh510050','sh510300','sh510500'],
+    '医药/生物': ['sh512010','sh512170','sh159845'],
+    '消费/白酒': ['sh512690','sh512200'],
+    '新能源/光伏': ['sh515210','sh516510'],
+    '资源/周期': ['sh515220'],  # 煤炭ETF
+    '军工/高端制造': ['sh512660','sh512980'],
+    '金融/红利': ['sh512880','sh513180'],
+    '传媒/机器人': ['sh516970','sh562500','sh159766'],
+}
+# 扁平化候选列表（兼容旧代码）
+ETF_CANDIDATES = []
+for _sector_etfs in ETF_CANDIDATES_BY_SECTOR.values():
+    for _code in _sector_etfs:
+        if _code not in ETF_CANDIDATES:
+            ETF_CANDIDATES.append(_code)
 
 TRACKED_ETFS = ['sh512690', 'sz159781']
 TRACKED_ETF_NAMES = {'sh512690': '酒ETF(512690)', 'sz159781': '科创创业ETF易方达(159781)'}
@@ -836,9 +848,79 @@ def filter_and_rank(stocks, top_n=5):
     qualified.sort(key=lambda x: x['score'], reverse=True)
     return qualified[:top_n]
 
+def get_etf_weekly_trend(code):
+    """获取ETF周线/月线趋势判断（方案A核心）
+    拉取250天日K → 转换为周线 → 计算周MA20和月MA5
+    返回: {'weekly_ma20': x, 'monthly_ma5': y, 'weekly_bull': bool, 'monthly_bull': bool, 'below_weekly_ma20_pct': z}
+    """
+    try:
+        # 使用 kline 端点（fqkline 端点被WAF拦截）
+        url = f"https://web.ifzq.gtimg.cn/appstock/app/kline/kline?param={code},day,,,250"
+        resp = requests.get(url, headers=HEADERS, timeout=10)
+        data = resp.json()
+        d = data.get('data', {})
+        if isinstance(d, dict):
+            stock_data = d.get(code, {})
+            if isinstance(stock_data, dict):
+                klines_raw = stock_data.get('qfqday', stock_data.get('day', []))
+            else:
+                klines_raw = []
+        else:
+            klines_raw = []
+        if not klines_raw or len(klines_raw) < 60:
+            return None
+        closes = [safe_float(k[2]) for k in klines_raw[-250:]]
+        price = closes[-1]
+
+        # 日K → 周K（每5个交易日聚合为1周）
+        weekly_closes = []
+        for i in range(0, len(closes), 5):
+            week = closes[i:i+5]
+            if week:
+                weekly_closes.append(week[-1])  # 取每周收盘
+
+        # 周MA20 = 20周均线
+        weekly_ma20 = sum(weekly_closes[-20:]) / 20 if len(weekly_closes) >= 20 else (sum(weekly_closes) / len(weekly_closes) if weekly_closes else 0)
+        weekly_bull = price > weekly_ma20 if weekly_ma20 > 0 else False
+        below_weekly_ma20_pct = (weekly_ma20 - price) / weekly_ma20 * 100 if weekly_ma20 > 0 else 0
+
+        # 日K → 月K（每20个交易日聚合为1月）
+        monthly_closes = []
+        for i in range(0, len(closes), 20):
+            month = closes[i:i+20]
+            if month:
+                monthly_closes.append(month[-1])
+
+        # 月MA5 = 5月均线
+        monthly_ma5 = sum(monthly_closes[-5:]) / 5 if len(monthly_closes) >= 5 else (sum(monthly_closes) / len(monthly_closes) if monthly_closes else 0)
+        monthly_bull = price > monthly_ma5 if monthly_ma5 > 0 else False
+        below_monthly_ma5_pct = (monthly_ma5 - price) / monthly_ma5 * 100 if monthly_ma5 > 0 else 0
+
+        return {
+            'weekly_ma20': weekly_ma20,
+            'monthly_ma5': monthly_ma5,
+            'weekly_bull': weekly_bull,
+            'monthly_bull': monthly_bull,
+            'below_weekly_ma20_pct': below_weekly_ma20_pct,
+            'below_monthly_ma5_pct': below_monthly_ma5_pct,
+        }
+    except:
+        return None
+
+
 def pick_etfs(etf_data, top_n=3):
-    """ETF选股：适合小资金博大收益
-    筛选标准：
+    """ETF选股：适合小资金博大收益（A+B方案升级版）
+    
+    方案A — 周线/月线趋势硬过滤：
+    - 获取250天日K → 转换周线MA20/月线MA5
+    - 跌破周线MA20超7% → 淘汰（中线破位）
+    - 跌破月线MA5超5% → 淘汰（长线趋势破坏）
+    
+    方案B — 行业分散：
+    - 每个行业类别最多推荐1只ETF
+    - 避免科创/半导体等同质化推荐
+    
+    其他筛选：
     - 安全边际：剔除单边下跌（MA5>MA10=上升趋势）、52周位置20-70%
     - 成长性：近期5日涨幅>-3%、有成长主题
     - 流动性：成交额>5亿
@@ -856,14 +938,44 @@ def pick_etfs(etf_data, top_n=3):
         low_52w = e.get('low_52w', 0)
         trend_up = e.get('trend_up', False)
         near_5d_chg = e.get('near_5d_chg', 0)
-        
+        code = e.get('code', '')
+
+        # ★★★ 方案A：周线/月线趋势硬过滤 ★★★
+        weekly_trend = e.get('weekly_trend')  # 优先用预获取的
+        if weekly_trend is None:
+            # 预获取失败时，实时获取（需补全前缀）
+            if code.startswith(('sh','sz')):
+                full_code = code
+            elif code[0] in ('5','6','9'):
+                full_code = f'sh{code}'
+            else:
+                full_code = f'sz{code}'
+            weekly_trend = get_etf_weekly_trend(full_code)
+        if weekly_trend:
+            below_w = weekly_trend['below_weekly_ma20_pct']
+            below_m = weekly_trend['below_monthly_ma5_pct']
+            # 跌破周线MA20超7% → 中线破位，直接淘汰
+            if below_w > 7:
+                continue
+            # 跌破月线MA5超5% → 长线趋势破坏，直接淘汰
+            if below_m > 5:
+                continue
+            # 评分加成：周线/月线多头
+            if weekly_trend['weekly_bull']:
+                score += 15; reasons.append('周线MA20上方')
+            else:
+                score += 5; reasons.append(f'周线MA20下方{below_w:.1f}%')
+            if weekly_trend['monthly_bull']:
+                score += 10; reasons.append('月线MA5上方')
+        # 周线数据不可用时不淘汰，但不加分（保持兼容性）
+
         # 1. 流动性筛选（必需）— 成交额>5亿
         amt_yi = amt_val / 1e4
         if amt_yi < 5: continue
         if amt_yi > 20: score += 15; reasons.append('流动性充裕')
         elif amt_yi > 10: score += 12; reasons.append('流动性良好')
         else: score += 8
-        
+
         # 2. 趋势安全边际（核心！）— 剔除单边下跌
         # MA5>MA10=上升趋势，否则为下跌趋势
         # 注意：K线数据可能因API限流获取不到，需用当日涨跌作为备用判断
@@ -884,7 +996,7 @@ def pick_etfs(etf_data, top_n=3):
                 score += 3
             else:
                 continue  # 当日跌超5%且无K线数据=可能单边下跌，淘汰
-        
+
         # 3. 52周位置（辅助判断）
         if high_52w > 0 and low_52w > 0 and price > 0:
             w52_pos = (price - low_52w) / (high_52w - low_52w) * 100
@@ -900,7 +1012,7 @@ def pick_etfs(etf_data, top_n=3):
             score += 8; reasons.append(f'52周{w52_pos:.0f}%低位')
         else:
             score += 2
-        
+
         # 4. 当日涨跌趋势
         if 0 < chg <= 5: score += 8; reasons.append(f'涨{chg:.1f}%')
         elif chg > 5: score += 6
@@ -908,24 +1020,89 @@ def pick_etfs(etf_data, top_n=3):
         elif -3 <= chg < -1: score += 3
         elif chg < -5: score += 1
         else: score += 2
-        
+
         # 5. 成长性主题
         for kw in growth_kw:
             if kw in name: score += 10; reasons.append(f'成长({kw})'); break
         else: score += 2
-        
+
         # 6. 小资金适配
         if 0.3 <= price <= 3: score += 10; reasons.append(f'价{price:.2f}小资金友好')
         elif 3 < price <= 5: score += 7
         elif 5 < price <= 10: score += 4
         else: score += 2
-        
+
+        # 标记行业类别（方案B用）
+        e['etf_sector'] = _classify_etf_sector(code, name)
+
         e['etf_score'] = score
-        e['etf_reasons'] = '·'.join(reasons[:4])
+        e['etf_reasons'] = '·'.join(reasons[:5])
         scored.append(e)
-    
+
     scored.sort(key=lambda x: x['etf_score'], reverse=True)
-    return scored[:top_n]
+
+    # ★★★ 方案B：行业分散 — 每类最多1只 ★★★
+    selected = []
+    seen_sectors = set()
+    for e in scored:
+        sector = e.get('etf_sector', '其他')
+        if sector not in seen_sectors:
+            selected.append(e)
+            seen_sectors.add(sector)
+            if len(selected) >= top_n:
+                break
+
+    return selected
+
+
+def _classify_etf_sector(code, name):
+    """根据ETF代码/名称分类行业类别"""
+    code_plain = code.replace('sh','').replace('sz','')
+    # 按代码/名称匹配
+    if any(k in name for k in ['科创','科50','科创50']):
+        return '科创/创业'
+    if any(k in name for k in ['芯片','半导体','科技','AI','人工智能','通信','云计算','信息']):
+        return '科技/半导体'
+    if any(k in name for k in ['医药','医疗','生物','健康']):
+        return '医药/生物'
+    if any(k in name for k in ['酒','消费','食品','白酒']):
+        return '消费/白酒'
+    if any(k in name for k in ['新能源','光伏','锂电','电池','碳中和','环保']):
+        return '新能源/光伏'
+    if any(k in name for k in ['煤炭','有色','钢铁','矿业','资源','黄金','铜','稀土']):
+        return '资源/周期'
+    if any(k in name for k in ['军工','国防','装备','航天']):
+        return '军工/高端制造'
+    if any(k in name for k in ['银行','券商','保险','金融','红利']):
+        return '金融/红利'
+    if any(k in name for k in ['传媒','游戏','动漫','机器人','智能']):
+        return '传媒/机器人'
+    if any(k in name for k in ['50','300','500','中证','A股','沪深']):
+        return '宽基/指数'
+    if any(k in name for k in ['港股','恒生','纳斯达克','纳指','标普','日经','德国']):
+        return '跨境/海外'
+    # 按代码兜底
+    if code_plain in ['588000','588200','512480','512760','159995','516160']:
+        return '科技/半导体'
+    if code_plain in ['159781','159919','515050']:
+        return '科创/创业'
+    if code_plain in ['512690','512200']:
+        return '消费/白酒'
+    if code_plain in ['512010','512170','159845']:
+        return '医药/生物'
+    if code_plain in ['515210','516510']:
+        return '新能源/光伏'
+    if code_plain in ['515220']:
+        return '资源/周期'
+    if code_plain in ['512660','512980']:
+        return '军工/高端制造'
+    if code_plain in ['512880','513180']:
+        return '金融/红利'
+    if code_plain in ['516970','562500','159766']:
+        return '传媒/机器人'
+    if code_plain in ['510050','510300','510500']:
+        return '宽基/指数'
+    return '其他'
 
 # ============================================================
 def generate_report():
@@ -989,6 +1166,23 @@ def generate_report():
                         e['ma20'] = ma20
                         e['near_5d_chg'] = (closes[-1] - closes[-5]) / closes[-5] * 100 if len(closes) >= 5 else 0
                         break
+    # ★ 方案A：批量获取ETF周线/月线趋势（250天K线）
+    print("  📈 获取ETF周线/月线趋势...")
+    weekly_ok = 0
+    for etf in all_etfs:
+        # get_stock_data返回的code无前缀，需补全sh/sz前缀
+        raw_code = etf['code']
+        if raw_code.startswith(('sh','sz')):
+            full_code = raw_code
+        elif raw_code[0] in ('5','6','9'):
+            full_code = f'sh{raw_code}'
+        else:
+            full_code = f'sz{raw_code}'
+        wt = get_etf_weekly_trend(full_code)
+        if wt:
+            etf['weekly_trend'] = wt
+            weekly_ok += 1
+    print(f"  ✅ 周线趋势获取: {weekly_ok}/{len(all_etfs)} 只成功")
     time.sleep(0.3)
 
     print("📊 [5/6] 获取跟踪ETF的52周数据...")
@@ -1230,12 +1424,13 @@ def generate_report():
         L.append(f"| {star} {i} | {s['code']} | **{s['name']}** | {num2(s['price'])} | {pct(s['chg_pct'])} | {amt_str} | {vr_str} | {tr_str} | **{s['score']}** | {reasons_raw} |")
     L.append(f"")
 
-    L.append(f"### 📦 精选 ETF")
+    L.append(f"### 📦 精选 ETF（行业分散+周线趋势过滤）")
     L.append(f"")
-    L.append(f"| 排名 | 代码 | 名称 | 最新价 | 涨跌幅 | 成交额 | 推荐理由 |")
-    L.append(f"|------|------|------|--------|--------|--------|----------|")
+    L.append(f"| 排名 | 代码 | 名称 | 行业 | 最新价 | 涨跌幅 | 成交额 | 推荐理由 |")
+    L.append(f"|------|------|------|------|--------|--------|--------|----------|")
     for i, e in enumerate(top_etfs, 1):
-        L.append(f"| {'⭐' if i==1 else '★'} {i} | {e['code']} | **{e['name']}** | {num2(e['price'])} | {pct(e['chg_pct'])} | {amt(e['amount'])} | {e.get('etf_reasons','')} |")
+        sector = e.get('etf_sector', '其他')
+        L.append(f"| {'⭐' if i==1 else '★'} {i} | {e['code']} | **{e['name']}** | {sector} | {num2(e['price'])} | {pct(e['chg_pct'])} | {amt(e['amount'])} | {e.get('etf_reasons','')} |")
     L.append(f"")
 
     # 五、ETF 专项跟踪
@@ -1553,11 +1748,33 @@ def generate_report():
             action.append(f"⚖️ **建议**：**观望**，根据大盘走势决定加减仓")
 
         # 个性化建议（按标的属性）
+        # 先获取周线/月线趋势（ETF专用）
+        weekly_trend_holding = None
+        if '512690' in code or '159781' in code:
+            try:
+                # code是无前缀的纯数字，5开头=沪市，1开头=深市
+                if code.startswith('5'):
+                    full_code = f'sh{code}'
+                else:
+                    full_code = f'sz{code}'
+                weekly_trend_holding = get_etf_weekly_trend(full_code)
+            except: pass
+
         if '512690' in code:
             forecast.append(f"🍶 **板块逻辑**：白酒板块短期受双节消费预期提振，但中长期受经济复苏节奏制约")
+            if weekly_trend_holding:
+                w_bull = '✅周线MA20上方' if weekly_trend_holding['weekly_bull'] else f'❌周线MA20下方{weekly_trend_holding["below_weekly_ma20_pct"]:.1f}%'
+                m_bull = '✅月线MA5上方' if weekly_trend_holding['monthly_bull'] else f'❌月线MA5下方{weekly_trend_holding["below_monthly_ma5_pct"]:.1f}%'
+                forecast.append(f"📊 **中长期趋势**：{w_bull}，{m_bull}")
             action.append(f"💡 **板块跟踪**：关注贵州茅台/五粮液批价、库存数据、双节动销情况")
         elif '159781' in code:
             forecast.append(f"🔬 **板块逻辑**：科创创业50集中半导体+新能源+生物医药，受美联储加息周期影响较大")
+            if weekly_trend_holding:
+                w_bull = '✅周线MA20上方' if weekly_trend_holding['weekly_bull'] else f'❌周线MA20下方{weekly_trend_holding["below_weekly_ma20_pct"]:.1f}%'
+                m_bull = '✅月线MA5上方' if weekly_trend_holding['monthly_bull'] else f'❌月线MA5下方{weekly_trend_holding["below_monthly_ma5_pct"]:.1f}%'
+                forecast.append(f"📊 **中长期趋势**：{w_bull}，{m_bull}")
+                if not weekly_trend_holding['weekly_bull'] and weekly_trend_holding['below_weekly_ma20_pct'] > 3:
+                    action.append(f"⚠️ **趋势警示**：周线已破位，反弹至MA20附近考虑减仓，不宜追加")
             action.append(f"💡 **板块跟踪**：关注半导体周期回升、新能源车销量、医药创新审批进度")
         elif '300457' in code:
             forecast.append(f"🔋 **板块逻辑**：锂电池设备景气度与新能源车销量正相关，PE 22倍处于历史中位偏低")

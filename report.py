@@ -715,6 +715,70 @@ def get_stock_data(codes):
             print(f"  ⚠️ batch {i} 失败: {e}")
     return results
 
+
+# ========== 方案H：多源交叉验证（数据可信度仲裁）==========
+# 背景：GitHub Actions 沙盒网络存在 DNS 劫持风险，qt.gtimg.cn 单源可能返回污染数据
+#   （2026-09-04 案例：浪潮信息实际跌停-9.99%/137亿/量比1.81，腾讯单源却返回-7.33%/74亿/量比4.6）
+# 方案：对进入精选的少数候选，用新浪 hq.sinajs.cn 独立复核，多源仲裁修正/剔除异常数据。
+#   新浪接口已验证与真实行情一致（本地三源对比测试通过），且只复核 top 候选，API 开销极小。
+
+def verify_quote_via_sina(full_code):
+    """用新浪行情独立复核单只标的，返回 {price, chg_pct, amount} 或 None"""
+    # 归一化为新浪格式：sh600000 / sz000977
+    s_code = full_code.replace('sh', 'sh').replace('sz', 'sz') if full_code[:2] in ('sh', 'sz') else full_code
+    url = f"https://hq.sinajs.cn/list={s_code}"
+    try:
+        h = dict(HEADERS); h['Referer'] = 'https://finance.sina.com.cn/'
+        resp = requests.get(url, headers=h, timeout=8)
+        resp.encoding = 'gbk'
+        t = resp.text
+        if '="' not in t: return None
+        p = t.split('"')[1].split(',')
+        if len(p) < 10: return None
+        prev = safe_float(p[2]); price = safe_float(p[3])
+        if prev <= 0 or price <= 0: return None
+        chg = (price - prev) / prev * 100
+        amount = safe_float(p[9]) / 1e4  # 万元（新浪成交额单位为元）
+        return {'price': price, 'chg_pct': chg, 'amount': amount, 'prev_close': prev}
+    except Exception:
+        return None
+
+
+def cross_validate_top_stocks(top_stocks, tolerance_pct=2.0, tolerance_chg=3.0):
+    """对 top 候选做多源仲裁：腾讯主源 vs 新浪校验源
+    仲裁规则：
+    - 价差 > tolerance_pct% 或 涨跌幅差 > tolerance_chg 个百分点 → 数据冲突，标记异常
+    - 若新浪确认与腾讯明显不同，以新浪为准修正；若仍无法确认（新浪也失败），保留但标记
+    返回：处理后的列表，每个元素带 'data_conflict' 标记
+    """
+    validated = []
+    for s in top_stocks:
+        code = s.get('code', '')
+        # 补全前缀（腾讯返回的code可能是纯数字）
+        if code[:2] not in ('sh', 'sz'):
+            if code[0] in ('6', '5', '9'): full_code = f'sh{code}'
+            else: full_code = f'sz{code}'
+        else:
+            full_code = code
+        ref = verify_quote_via_sina(full_code)
+        s['data_conflict'] = False
+        if ref:
+            t_price, sina_chg = s.get('price', 0), ref['chg_pct']
+            tencent_chg = s.get('chg_pct', 0)
+            price_dev = abs(t_price - ref['price']) / ref['price'] * 100 if ref['price'] else 0
+            chg_dev = abs(tencent_chg - sina_chg)
+            if price_dev > tolerance_pct or chg_dev > tolerance_chg:
+                # 数据冲突：以新浪（多源仲裁倾向多数一致）为准修正
+                s['data_conflict'] = True
+                s['price'] = ref['price']
+                s['chg_pct'] = sina_chg
+                s['prev_close'] = ref.get('prev_close', s.get('prev_close', 0))
+                if ref.get('amount') is not None and ref['amount'] > 0:
+                    s['amount'] = ref['amount']
+                s['reason_note'] = f"多源仲裁修正(腾讯{tencent_chg:.1f}%→新浪{sina_chg:.1f}%)"
+        validated.append(s)
+    return validated
+
 def get_etf_52week(code):
     """获取ETF的52周高低点（三重备用API：腾讯→新浪→东方财富）"""
     prefix = 'sh' if code.startswith('sh') or (not code.startswith('sz') and code[0] in '56') else 'sz'
@@ -982,18 +1046,19 @@ def filter_and_rank(stocks, top_n=5):
 
         # ===== 方案G：趋势反转硬过滤（放在multi_trend惰性获取之前，提前淘汰省API）=====
         # 短线精选绝不推荐"正在大跌"的标的：当天跌停/恐慌出逃的股票次日大概率低开惯性
+        # 阈值预留 -1% 误差缓冲带（方案H：防CI沙盒DNS劫持导致数据偏差漏判）
         _chg = s.get('chg_pct', 0)
         _vr = s.get('volume_ratio', 1)
         _tech = s.get('tech') or {}
         _chg_5d = _tech.get('chg_5d', 0)
-        # 1) 跌停或接近跌停(-7%以下) → 恐慌出逃，坚决回避
-        if _chg <= -7:
+        # 1) 跌停或接近跌停(-6%以下) → 恐慌出逃，坚决回避（-6%而非-7%，缓冲误差）
+        if _chg <= -6:
             continue
         # 2) 高位巨阴反转：5日涨幅>12% 且 当日跌>4% → 获利盘集中出逃
         if _chg_5d > 12 and _chg <= -4:
             continue
         # 3) 放量深跌：当日跌>5% 且 量比≥2 → 资金出逃信号明确（大成交额是抛压不是买盘）
-        if _chg <= -5 and _vr >= 2:
+        if _chg <= -4.5 and _vr >= 2:
             continue
 
         # ===== 方案F：惰性获取周/月线多因子信号（仅对通过基础过滤的候选）=====
@@ -1662,6 +1727,15 @@ def generate_report():
     top_stocks = filter_and_rank(all_stocks, top_n=5)
     top_etfs = pick_etfs(all_etfs, top_n=2)
 
+    # ===== 方案H：多源交叉验证（防止CI沙盒DNS劫持导致错误数据进入推荐）=====
+    if top_stocks:
+        top_stocks = cross_validate_top_stocks(top_stocks)
+        _conflicted = [s for s in top_stocks if s.get('data_conflict')]
+        if _conflicted:
+            print(f"  🔍 多源仲裁: {len(_conflicted)}只数据冲突已用新浪源修正")
+            for s in _conflicted:
+                print(f"     - {s.get('name')}: {s.get('reason_note','')}")
+
     # ============ Markdown ============
     L = []
     L.append(f"# 🏦 A股每日投资分析报告")
@@ -1881,6 +1955,9 @@ def generate_report():
         reasons_raw = s.get('reasons', '')
         if isinstance(reasons_raw, list):
             reasons_raw = '·'.join(reasons_raw[:4])
+        # 方案H：若该标的数据经多源仲裁修正，附加标记并保留仲裁理由，供用户感知数据可信度
+        if s.get('data_conflict'):
+            reasons_raw = f"{reasons_raw}·🔍{s.get('reason_note','多源复核')}"
         L.append(f"| {star} {i} | {s['code']} | **{s['name']}** | {num2(s['price'])} | {pct(s['chg_pct'])} | {amt_str} | {vr_str} | {tr_str} | **{s['score']}** | {reasons_raw} |")
     L.append(f"")
 

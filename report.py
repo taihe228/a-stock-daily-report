@@ -790,21 +790,34 @@ def score_stock_shortterm(s):
     tech = s.get('tech', {})             # K线技术指标
 
     # ===== 1. 资金强度 (20分) =====
-    # 成交额 (10分) — 反映资金参与度
+    # 方案G：方向感知 — 深跌日的大成交额/高量比是恐慌抛售盘，不是资金参与度
+    # （例：浪潮信息跌停日成交74亿、量比4.6倍，是出逃不是进场，不能给资金分）
+    panic_day = chg_pct <= -4
+    # 成交额 (10分) — 反映资金参与度（恐慌日减半）
     amt_yi = amount / 1e4
-    if amt_yi >= 100: score += 10; reasons.append(f'成交{amt_yi:.0f}亿')
-    elif amt_yi >= 50: score += 9
-    elif amt_yi >= 20: score += 7; reasons.append(f'成交{amt_yi:.0f}亿')
-    elif amt_yi >= 10: score += 5
-    elif amt_yi >= 5: score += 3
-    else: score += 1
+    if amt_yi >= 100: amt_score = 10
+    elif amt_yi >= 50: amt_score = 9
+    elif amt_yi >= 20: amt_score = 7
+    elif amt_yi >= 10: amt_score = 5
+    elif amt_yi >= 5: amt_score = 3
+    else: amt_score = 1
+    if panic_day:
+        amt_score = min(amt_score, 3)
+    else:
+        if amt_yi >= 20: reasons.append(f'成交{amt_yi:.0f}亿')
+    score += amt_score
 
-    # 量比 (10分) — 当日放量程度
-    if volume_ratio >= 3.0: score += 10; reasons.append(f'量比{volume_ratio:.1f}倍')
-    elif volume_ratio >= 2.0: score += 8; reasons.append(f'量比{volume_ratio:.1f}倍')
-    elif volume_ratio >= 1.5: score += 6
-    elif volume_ratio >= 1.0: score += 4
-    else: score += 2
+    # 量比 (10分) — 当日放量程度（恐慌日放量=出逃加速，不给分）
+    if volume_ratio >= 3.0: vr_score = 10
+    elif volume_ratio >= 2.0: vr_score = 8
+    elif volume_ratio >= 1.5: vr_score = 6
+    elif volume_ratio >= 1.0: vr_score = 4
+    else: vr_score = 2
+    if panic_day:
+        vr_score = min(vr_score, 2)
+    else:
+        if volume_ratio >= 2.0: reasons.append(f'量比{volume_ratio:.1f}倍')
+    score += vr_score
 
     # ===== 2. 量价共振 (20分) =====
     # 涨幅方向 (10分)
@@ -925,6 +938,19 @@ def score_stock_shortterm(s):
         # 月线空头排列 → 降分（熊市结构）
         if mt.get('month_bear_align'): score -= 4; reasons.append('月线空头')
 
+    # ===== 8. 趋势反转风险（方案G，负分修正）=====
+    # 与超跌反弹逻辑的区分：超跌加分适用于"跌透了+止跌企稳"的场景；
+    # 反转降分针对"正在下跌途中"的标的 — 短线当天不接飞刀
+    # （chg_5d 已在趋势动量维度计算，tech缺失时退化为当日涨幅，不影响判断）
+    if chg_pct <= -5:
+        score -= 15; reasons.append(f'⚠️当日大跌{chg_pct:.1f}%')
+        if chg_5d > 12:
+            score -= 10; reasons.append('⚠️高位巨阴反转')
+    elif chg_pct <= -3 and volume_ratio >= 2:
+        score -= 8; reasons.append('⚠️放量下跌资金出逃')
+    elif chg_5d < -8:
+        score -= 5; reasons.append('⚠️短期趋势走弱')
+
     s['score'] = score
     s['reasons'] = reasons
     return s
@@ -952,6 +978,22 @@ def filter_and_rank(stocks, top_n=5):
         amt_yi = s.get('amount', 0) / 1e4
         turnover = s.get('turnover_rate', 0)
         if amt_yi < 5 or turnover < 1.5:
+            continue
+
+        # ===== 方案G：趋势反转硬过滤（放在multi_trend惰性获取之前，提前淘汰省API）=====
+        # 短线精选绝不推荐"正在大跌"的标的：当天跌停/恐慌出逃的股票次日大概率低开惯性
+        _chg = s.get('chg_pct', 0)
+        _vr = s.get('volume_ratio', 1)
+        _tech = s.get('tech') or {}
+        _chg_5d = _tech.get('chg_5d', 0)
+        # 1) 跌停或接近跌停(-7%以下) → 恐慌出逃，坚决回避
+        if _chg <= -7:
+            continue
+        # 2) 高位巨阴反转：5日涨幅>12% 且 当日跌>4% → 获利盘集中出逃
+        if _chg_5d > 12 and _chg <= -4:
+            continue
+        # 3) 放量深跌：当日跌>5% 且 量比≥2 → 资金出逃信号明确（大成交额是抛压不是买盘）
+        if _chg <= -5 and _vr >= 2:
             continue
 
         # ===== 方案F：惰性获取周/月线多因子信号（仅对通过基础过滤的候选）=====
@@ -1061,6 +1103,10 @@ def get_multi_trend(code):
         cur_vol = volumes[-1] if volumes else 0
         # 量价关系：正数=放量，负数=缩量
         vol_ratio = (cur_vol / vol_ma5 - 1) * 100 if vol_ma5 > 0 else 0
+
+        # 方案G：近20日/60日区间涨幅（用于板块景气度判断）
+        chg_20d = (closes[-1] - closes[-21]) / closes[-21] * 100 if len(closes) >= 21 else 0
+        chg_60d = (closes[-1] - closes[-61]) / closes[-61] * 100 if len(closes) >= 61 else 0
 
         # 日K → 周K（每5个交易日聚合为1周）
         weekly_closes = []
@@ -1213,6 +1259,9 @@ def get_multi_trend(code):
             'month_j_turning': month_j_turning,
             'month_j_rising_2m': month_j_rising_2m,
             'macd_bull_div': macd_bull_div,
+            # 方案G：区间涨幅（板块景气度判断）
+            'chg_20d': chg_20d,
+            'chg_60d': chg_60d,
         }
     except:
         return None
@@ -2268,11 +2317,18 @@ def generate_report():
                 news.append(f"🏗️ **{name}走强**（{chg_str}），{leader}领涨，关注稳增长政策")
             else:
                 news.append(f"📈 **{name}领涨**（{chg_str}），{leader}表现突出")
-    # 固定要闻补充
-    # 固定要闻补充（时效性内容）
-    news.append("📊 **A股成交额持续万亿以上**，市场活跃度维持高位，资金参与意愿较强")
-    news.append("📈 **央行维持适度宽松货币政策**，流动性充裕支撑市场估值")
-    news.append("🤖 **AI+机器人产业链持续活跃**，多只概念股获机构密集调研")
+    # 固定要闻补充（方案G：基于当日实际数据生成，不再硬编码无来源断言）
+    if total_amount and total_amount > 0:
+        amt_yi_mkt = total_amount / 1e8
+        if amt_yi_mkt >= 15000:
+            news.append(f"📊 **两市成交额{amt_yi_mkt/10000:.1f}万亿**，处于历史高位区间，市场活跃度极高")
+        elif amt_yi_mkt >= 10000:
+            news.append(f"📊 **两市成交额{amt_yi_mkt/10000:.1f}万亿**，维持万亿上方，资金参与意愿较强")
+        elif amt_yi_mkt >= 8000:
+            news.append(f"📊 **两市成交额{amt_yi_mkt:.0f}亿**，接近万亿水平，关注量能能否放大")
+        else:
+            news.append(f"📊 **两市成交额{amt_yi_mkt:.0f}亿**，量能偏弱，存量博弈特征明显，注意控制仓位")
+    news.append("📈 **政策面跟踪**：关注央行流动性操作及行业政策动向对市场情绪的影响")
     for i, item in enumerate(news[:10], 1):
         L.append(f"{i}. {item}")
         L.append(f"")
@@ -2299,9 +2355,48 @@ def generate_report():
 
     L.append(f"### 关键信号")
     L.append(f"")
-    L.append(f"- ✅ 增量资金入场信号明确")
+    # ===== 方案G：关键信号数据化（不再硬编码，全部基于当日实际行情）=====
+    # 信号1：增量资金 — 判断标准：上证量能(当日量vs5日均量) × 指数涨跌方向
+    #   放量上涨=增量入场；缩量上涨=信号不足；放量下跌=资金离场
+    try:
+        sh_mt = get_multi_trend('sh000001')
+    except:
+        sh_mt = None
+    if sh_mt and sh:
+        vr_mkt = sh_mt.get('vol_ratio', 0)  # 量能偏离度：+50=放量50%，-36=缩量36%
+        chg_mkt = sh.get('chg_pct', 0)
+        if chg_mkt > 0 and vr_mkt >= 15:
+            L.append(f"- ✅ 增量资金入场信号明确：两市放量上涨（量能较5日均量放大{vr_mkt:.0f}%）")
+        elif chg_mkt > 0 and vr_mkt >= -5:
+            L.append(f"- ⚪ 温和放量上涨（量能较5日均量{vr_mkt:+.0f}%），增量资金信号初步显现")
+        elif chg_mkt > 0:
+            L.append(f"- ⚠️ 缩量上涨（量能较5日均量{vr_mkt:+.0f}%），增量资金入场信号不足，上攻持续性存疑")
+        elif chg_mkt > -1 and vr_mkt < 0:
+            L.append(f"- ⚪ 缩量窄幅震荡（{pct(chg_mkt)}），增量资金观望")
+        else:
+            L.append(f"- ⚠️ 放量下跌（量能较5日均量{vr_mkt:+.0f}%），资金离场迹象明显，注意防御")
+    else:
+        L.append(f"- ⚪ 量能数据获取失败，增量资金信号待观察")
+
+    # 信号2：半导体/AI产业链景气度 — 判断标准：科创50（半导体权重超七成）近20日/60日实际走势
+    #   20日>+5%且60日为正=回升确认；20日<-5%或60日<-10%=回调期；其余=震荡待确认
+    try:
+        kc_mt = get_multi_trend('sh000688')
+    except:
+        kc_mt = None
+    if kc_mt:
+        c20 = kc_mt.get('chg_20d', 0)
+        c60 = kc_mt.get('chg_60d', 0)
+        if c20 > 5 and c60 > 0:
+            L.append(f"- ✅ 半导体/AI产业链景气度回升确认：科创50近20日{c20:+.1f}%、近60日{c60:+.1f}%")
+        elif c20 < -5 or c60 < -10:
+            L.append(f"- ⚠️ 半导体/AI产业链处于回调期：科创50近20日{c20:+.1f}%、近60日{c60:+.1f}%，景气度确认需等待量价企稳信号，不宜盲目抄底")
+        else:
+            L.append(f"- ⚪ 半导体/AI产业链景气度震荡待确认：科创50近20日{c20:+.1f}%、近60日{c60:+.1f}%")
+    else:
+        L.append(f"- ⚪ 科创50趋势数据获取失败，半导体景气度待观察")
+
     L.append(f"- ✅ 全市场选股，多维度量化评分，精选优质标的")
-    L.append(f"- ✅ 半导体/AI产业链景气度确认")
     L.append(f"- ⚠️ 市场结构性分化，需精选方向")
     L.append(f"")
 

@@ -839,7 +839,7 @@ def get_etf_52week(code):
 # ============================================================
 def score_stock_shortterm(s):
     """专业短线选股评分模型（六大维度，满分100分）
-    资金强度20% + 量价共振20% + 趋势动量20% + 板块加持15% + 盘口活跃15% + 基本面10%
+    资金强度20% + 量价共振20% + 趋势动量20% + 板块加持10% + 盘口活跃10% + 基本面20%
     """
     score, reasons = 0, []
     price = s.get('price', 0)
@@ -928,52 +928,52 @@ def score_stock_shortterm(s):
     score += macd
     if streak >= 3: score += 3; reasons.append(f'{streak}连阳')
 
-    # ===== 4. 板块加持 (15分) =====
+    # ===== 4. 板块加持 (10分) =====
     sector_chg = s.get('sector_chg', 0)
     relative_chg = chg_pct - sector_chg
 
-    # 板块涨跌 (8分)
-    if sector_chg > 2: score += 8
-    elif sector_chg > 1: score += 6
-    elif sector_chg > 0: score += 4
-    elif sector_chg > -1: score += 3
+    # 板块涨跌 (5分)
+    if sector_chg > 2: score += 5
+    elif sector_chg > 1: score += 4
+    elif sector_chg > 0: score += 3
+    elif sector_chg > -1: score += 2
     else: score += 1
 
-    # 个股相对板块超额 (7分) — 龙头属性
-    if relative_chg > 5: score += 7; reasons.append(f'跑赢板块{relative_chg:.1f}%')
-    elif relative_chg > 3: score += 6
-    elif relative_chg > 1: score += 5
-    elif relative_chg > 0: score += 3
+    # 个股相对板块超额 (5分) — 龙头属性
+    if relative_chg > 5: score += 5; reasons.append(f'跑赢板块{relative_chg:.1f}%')
+    elif relative_chg > 3: score += 4
+    elif relative_chg > 1: score += 3
+    elif relative_chg > 0: score += 2
     else: score += 1
 
-    # ===== 5. 盘口活跃 (15分) =====
-    # 换手率 (8分)
-    if 3 <= turnover <= 10: score += 8; reasons.append(f'换手{turnover:.1f}%')
-    elif 10 < turnover <= 20: score += 7
-    elif 1.5 <= turnover < 3: score += 4
-    elif turnover > 20: score += 3
+    # ===== 5. 盘口活跃 (10分) =====
+    # 换手率 (5分)
+    if 3 <= turnover <= 10: score += 5; reasons.append(f'换手{turnover:.1f}%')
+    elif 10 < turnover <= 20: score += 4
+    elif 1.5 <= turnover < 3: score += 3
+    elif turnover > 20: score += 2
     else: score += 1
 
-    # 日内形态 (7分)
+    # 日内形态 (5分)
     if high > low and high > 0:
         day_pos = (price - low) / (high - low) * 100
-        if day_pos >= 80: score += 7; reasons.append('收于日高附近')
-        elif day_pos >= 60: score += 5
+        if day_pos >= 80: score += 5; reasons.append('收于日高附近')
+        elif day_pos >= 60: score += 4
         elif day_pos >= 40: score += 3
         else: score += 1
 
-    # ===== 6. 基本面 (10分) =====
-    # 流通市值 (5分)
-    if 50 <= market_cap <= 500: score += 5; reasons.append('市值适中')
-    elif 20 <= market_cap < 50: score += 4
-    elif 500 < market_cap <= 2000: score += 3
-    else: score += 2
+    # ===== 6. 基本面 (20分) =====
+    # 流通市值 (10分)
+    if 50 <= market_cap <= 500: score += 10; reasons.append('市值适中')
+    elif 20 <= market_cap < 50: score += 8
+    elif 500 < market_cap <= 2000: score += 6
+    else: score += 4
 
-    # PE (5分)
-    if pe and 10 < pe < 50: score += 5; reasons.append(f'PE{pe:.0f}')
-    elif pe and 0 < pe <= 100: score += 3
-    elif pe and pe > 0: score += 2
-    else: score += 1
+    # PE (10分)
+    if pe and 10 < pe < 50: score += 10; reasons.append(f'PE{pe:.0f}')
+    elif pe and 0 < pe <= 100: score += 6
+    elif pe and pe > 0: score += 4
+    else: score += 2
 
     # ===== 7. 多因子择时（方案D+E，±20分）=====
     # 复用周/月线多因子信号：MACD底背离、止跌K线、月J拐点、周/月线趋势等

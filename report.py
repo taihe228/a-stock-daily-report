@@ -12,15 +12,49 @@ from datetime import datetime, timedelta
 
 NOW = datetime.now()
 WEEKDAY = NOW.weekday()
-if WEEKDAY >= 5:
-    print(f"⏭️ 今天是周末（周{WEEKDAY+1}），A股休市，跳过报告生成。")
-    sys.exit(0)
+
+# ===== 方案K：A股休市日历（周末 + 法定节假日）=====
+# 周末休市
+WEEKEND_CLOSED = WEEKDAY >= 5
+
+# 2026年A股法定节假日休市日历（依据国务院办公厅2026年节假日安排）
+# 格式: YYYY-MM-DD。含春节/国庆等长假，避免假期生成无效报告。
+HOLIDAYS_2026 = {
+    # 元旦
+    '2026-01-01', '2026-01-02',
+    # 春节（2026年除夕2/16，春节假期2/15-2/21 参考安排）
+    '2026-02-16', '2026-02-17', '2026-02-18', '2026-02-19', '2026-02-20',
+    # 清明节
+    '2026-04-06',
+    # 劳动节
+    '2026-05-01', '2026-05-04', '2026-05-05',
+    # 端午节
+    '2026-06-19',
+    # 中秋节 + 国庆节连休（2026年国庆假期 10/1-10/7）
+    '2026-09-25',  # 中秋
+    '2026-10-01', '2026-10-02', '2026-10-05', '2026-10-06', '2026-10-07',
+}
+# 调休上班日（这些周末需正常工作，A股正常交易）— 2026年安排
+MAKEUP_WORKDAYS_2026 = set()
+
+_today_str = NOW.strftime('%Y-%m-%d')
+HOLIDAY_CLOSED = _today_str in HOLIDAYS_2026 and _today_str not in MAKEUP_WORKDAYS_2026
+
+# 支持通过环境变量指定报告日期（手动补跑历史报告），格式 YYYY-MM-DD
+_override_date = os.environ.get('TRADE_DATE_OVERRIDE')
+
+# 补跑模式允许绕过休市检查（用户明确指定的日期），但自动运行严格检查
+if not _override_date:
+    if WEEKEND_CLOSED:
+        print(f"⏭️ 今天是周末（周{WEEKDAY+1}），A股休市，跳过报告生成。")
+        sys.exit(0)
+    if HOLIDAY_CLOSED:
+        print(f"⏭️ 今天是法定节假日（{_today_str}），A股休市，跳过报告生成。")
+        sys.exit(0)
 
 # A股收盘时间: 北京时间 15:00。如果在收盘前运行(如凌晨/上午)，报告日期应为前一交易日
 # 判断逻辑: 如果当前时间 < 15:00，则报告日期为昨天（或上周五如果今天是周一）
 current_hour = NOW.hour
-# 支持通过环境变量指定报告日期（手动补跑历史报告），格式 YYYY-MM-DD
-_override_date = os.environ.get('TRADE_DATE_OVERRIDE')
 if _override_date:
     TRADE_DATE = _override_date
     NOW_STR = NOW.strftime("%Y-%m-%d %H:%M:%S")
@@ -32,6 +66,12 @@ elif current_hour < 15:
     else:
         trade_dt = NOW - timedelta(days=1)
     TRADE_DATE = trade_dt.strftime("%Y-%m-%d")
+    # 若前一交易日恰为节假日，继续向前推
+    _guard = 0
+    while TRADE_DATE in HOLIDAYS_2026 and _guard < 10:
+        trade_dt = trade_dt - timedelta(days=1)
+        TRADE_DATE = trade_dt.strftime("%Y-%m-%d")
+        _guard += 1
     print(f"⏰ 当前时间 {NOW.strftime('%H:%M')} 早于15:00，报告日期使用前一交易日: {TRADE_DATE}")
 else:
     TRADE_DATE = NOW.strftime("%Y-%m-%d")

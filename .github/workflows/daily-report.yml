@@ -5,15 +5,26 @@ on:
     # 目标: 北京时间每晚 20:00 (UTC+8 = UTC 12:00)
     # GitHub Actions cron 实测延迟约 5 小时，所以提前到 UTC 6:00-9:00 触发
     # 延迟后实际执行时间约在 北京 19:00-22:00
+    # 方案I：错峰+冗余触发 — GitHub Actions 偶尔漏派 cron（2026-09-14、9-15 案例），
+    #       增加午后/夜间双二次触发作为兜底，覆盖更宽窗口（UTC 11-15 ≈ 北京 19-23）
     - cron: '0 6 * * 1-5'
     - cron: '30 6 * * 1-5'
     - cron: '0 7 * * 1-5'
     - cron: '30 7 * * 1-5'
     - cron: '0 8 * * 1-5'
     - cron: '0 9 * * 1-5'
+    - cron: '30 11 * * 1-5'    # 兜底触发（UTC 11:30 ≈ 北京 19:30）
+    - cron: '0 13 * * 1-5'     # 兜底触发（UTC 13:00 ≈ 北京 21:00）
+    - cron: '30 14 * * 1-5'    # 兜底触发（UTC 14:30 ≈ 北京 22:30）
+    - cron: '0 15 * * 1-5'     # 最后兜底（UTC 15:00 ≈ 北京 23:00，覆盖最坏延迟）
   
-  # 允许手动触发
+  # 允许手动触发（可指定补跑历史日期）
   workflow_dispatch:
+    inputs:
+      trade_date:
+        description: '补跑日期（YYYY-MM-DD），留空则使用当天'
+        required: false
+        default: ''
 
 jobs:
   generate-report:
@@ -36,8 +47,12 @@ jobs:
       - name: 生成报告
         env:
           TZ: Asia/Shanghai
+          TRADE_DATE_OVERRIDE: ${{ inputs.trade_date }}
         run: |
           echo "当前北京时间: $(date '+%Y-%m-%d %H:%M:%S %A')"
+          if [ -n "$TRADE_DATE_OVERRIDE" ]; then
+            echo "📅 手动补跑指定日期: $TRADE_DATE_OVERRIDE"
+          fi
           mkdir -p output
           OUTPUT_DIR="$PWD/output" python report.py
       
@@ -71,6 +86,9 @@ jobs:
           if git diff --cached --quiet; then
             echo "没有新报告需要提交"
           else
-            git commit -m "📊 自动生成 $(date +%Y-%m-%d) A股投资分析报告"
+            # commit 消息用报告文件中的日期（支持补跑历史报告时日期准确）
+            REPORT_DATE=$(ls -t output/A股投资分析报告_*.md 2>/dev/null | head -1 | grep -oE '20[0-9]{2}-[0-9]{2}-[0-9]{2}' | head -1)
+            [ -z "$REPORT_DATE" ] && REPORT_DATE=$(date +%Y-%m-%d)
+            git commit -m "📊 自动生成 $REPORT_DATE A股投资分析报告"
             git push
           fi

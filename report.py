@@ -19,7 +19,13 @@ if WEEKDAY >= 5:
 # A股收盘时间: 北京时间 15:00。如果在收盘前运行(如凌晨/上午)，报告日期应为前一交易日
 # 判断逻辑: 如果当前时间 < 15:00，则报告日期为昨天（或上周五如果今天是周一）
 current_hour = NOW.hour
-if current_hour < 15:
+# 支持通过环境变量指定报告日期（手动补跑历史报告），格式 YYYY-MM-DD
+_override_date = os.environ.get('TRADE_DATE_OVERRIDE')
+if _override_date:
+    TRADE_DATE = _override_date
+    NOW_STR = NOW.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"📅 使用补跑日期: {TRADE_DATE}")
+elif current_hour < 15:
     # 收盘前运行，使用前一交易日
     if WEEKDAY == 0:  # 周一，前一交易日是上周五
         trade_dt = NOW - timedelta(days=3)

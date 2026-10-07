@@ -139,7 +139,8 @@ def get_stock_batch(codes_chunk, timeout=15):
 def get_all_stocks_parallel(candidates, batch_size=80, max_workers=6):
     """多线程并发获取全市场股票行情"""
     print(f"  📡 多线程查询 {len(candidates)} 只 ({max_workers}线程)...")
-    codes_only = [s['code'] for s in candidates]
+    # 方案J：兼容 dict（全市场候选）与 str（热点补充的代码）两种元素
+    codes_only = [s['code'] if isinstance(s, dict) else s for s in candidates]
     batches = [codes_only[i:i+batch_size] for i in range(0, len(codes_only), batch_size)]
     all_stocks, done = [], 0
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -572,16 +573,21 @@ HOT_SECTOR_STOCKS = {
 
 def expand_candidates_by_hot_sector(candidates, industry_sectors, max_add=20):
     """根据当日行业板块涨幅榜，动态补充热点板块代表股到候选池
-    candidates: 原始候选列表（可能是全市场也可能是样本池）
+    candidates: 原始候选列表（可能是全市场dict列表 也可能是样本池字符串列表）
     industry_sectors: 当日行业板块涨幅榜 [{name, chg, ...}, ...]
-    返回: 去重后的扩充候选列表
+    返回: 去重后的扩充候选列表（保持元素原类型）
     """
-    # 1. 去重（保留首次出现）
+    # 方案J：兼容 dict（全市场，含code字段）与 str（样本池代码）两种元素类型
+    def _key(c):
+        return c.get('code') if isinstance(c, dict) else c
+
+    # 1. 去重（按代码/字符串，保留首次出现）
     seen = set()
     deduped = []
     for c in candidates:
-        if c not in seen:
-            seen.add(c)
+        k = _key(c)
+        if k and k not in seen:
+            seen.add(k)
             deduped.append(c)
 
     # 2. 提取涨幅前N板块，匹配板块名
@@ -597,7 +603,7 @@ def expand_candidates_by_hot_sector(candidates, industry_sectors, max_add=20):
             if kw.split('/')[0] in sec_name or any(k in sec_name for k in kw.split('/')):
                 for stk in stocks:
                     if stk not in seen and added < max_add:
-                        deduped.append(stk)
+                        deduped.append(stk)   # 热点补充统一用字符串代码，后续 get_all_stocks_parallel 内部兼容
                         seen.add(stk)
                         added += 1
                 break  # 一板块只匹配一组
@@ -1644,8 +1650,13 @@ def generate_report():
             print(f"  ✅ 候选池扩充: {_before} -> {len(candidates)} (+{_delta} 热点)")
     except Exception as e:
         print(f"  ⚠️ 动态补充失败（不影响主流程）: {e}")
-        # 即使失败也做去重
-        candidates = list(dict.fromkeys(candidates))
+        # 即使失败也做去重（方案J：兼容 dict/str 两种元素类型）
+        _seen, _dedup = set(), []
+        for c in candidates:
+            k = c.get('code') if isinstance(c, dict) else c
+            if k and k not in _seen:
+                _seen.add(k); _dedup.append(c)
+        candidates = _dedup
     time.sleep(0.5)
 
     print(f"📊 [3/5] 多线程获取行情数据...")
